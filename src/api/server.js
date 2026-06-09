@@ -317,7 +317,8 @@ async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
     return null;
   }
 
-  // A. InnerTube directo (más rápido, sin cookies, ~1s)
+  // A. InnerTube directo (deshabilitado temporalmente porque no desencripta ciphers y da 403)
+  /*
   if (!isVideo) {
     try {
       const streamUrl = await innertube.getStreamUrl(videoId);
@@ -331,6 +332,7 @@ async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
       console.warn(`[stream] InnerTube failed for ${videoId}: ${e.message}`);
     }
   }
+  */
 
   // B. yt-dlp (fallback, saltear en Render sin cookies)
   if (!IS_RENDER || hasYtCookies) {
