@@ -308,15 +308,6 @@ async function resolveStreamUrl(identifier, req = null, forceRefresh = false, is
 async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
   const cacheKey = isVideo ? `${videoId}:video` : videoId;
 
-  // En Render sin cookies: solo Cobalt (play-dl bloquea en datacenter)
-  if (IS_RENDER && !hasYtCookies) {
-    console.log(`[stream] Render sin cookies: Cobalt directo para ${videoId}`);
-    const streamUrl = await resolveViaCobalt(videoId, isVideo);
-    if (streamUrl) { setCached(cacheKey, streamUrl); return streamUrl; }
-    failedVideoIds.set(cacheKey, Date.now());
-    return null;
-  }
-
   // A. InnerTube directo (deshabilitado temporalmente porque no desencripta ciphers y da 403)
   /*
   if (!isVideo) {
@@ -334,8 +325,8 @@ async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
   }
   */
 
-  // B. yt-dlp (fallback, saltear en Render sin cookies)
-  if (!IS_RENDER || hasYtCookies) {
+  // B. yt-dlp (funciona en Render aunque no haya cookies, @distube/yt-dlp trae binarios Linux)
+  {
     try {
       const streamUrl = await ytDlpGetUrl(`https://www.youtube.com/watch?v=${videoId}`, isVideo);
       if (streamUrl) {
@@ -352,7 +343,7 @@ async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
       console.warn(`[stream] yt-dlp failed for ${videoId}: ${msg}`);
     }
 
-    // C. play-dl (audio, saltear en Render)
+    // C. play-dl (audio)
     if (!isVideo) {
       try {
         const info = await play.video_info(`https://www.youtube.com/watch?v=${videoId}`).catch(async () => {
