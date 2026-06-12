@@ -308,9 +308,8 @@ async function resolveStreamUrl(identifier, req = null, forceRefresh = false, is
 async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
   const cacheKey = isVideo ? `${videoId}:video` : videoId;
 
-  // A. InnerTube directo (deshabilitado temporalmente porque no desencripta ciphers y da 403)
-  /*
-  if (!isVideo) {
+  // A. InnerTube directo (fallback principal en Render, YouTube bloquea IPs de datacenter)
+  if (IS_RENDER) {
     try {
       const streamUrl = await innertube.getStreamUrl(videoId);
       if (streamUrl) {
@@ -323,10 +322,9 @@ async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
       console.warn(`[stream] InnerTube failed for ${videoId}: ${e.message}`);
     }
   }
-  */
 
-  // B. yt-dlp (funciona en Render aunque no haya cookies, @distube/yt-dlp trae binarios Linux)
-  {
+  // B. yt-dlp (no funciona en Render sin cookies, YouTube bloquea IPs de datacenter)
+  if (!IS_RENDER || hasYtCookies) {
     try {
       const streamUrl = await ytDlpGetUrl(`https://www.youtube.com/watch?v=${videoId}`, isVideo);
       if (streamUrl) {
@@ -376,13 +374,27 @@ async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
 }
 
 async function resolveViaCobalt(videoId, isVideo = false) {
-  // Instancias y payloads: las originales devuelven URLs directas (audio/mpeg),
-  // las tunnel (dog/fox) requieren proxy pero el cliente Android no las reproduce bien
+  // Instancias y payloads según API v11 de Cobalt.
+  // downloadMode: auto (video), audio (solo audio), mute (video sin audio)
+  const basePayload = {
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    downloadMode: isVideo ? "auto" : "audio",
+    audioFormat: "best",
+    filenameStyle: "basic",
+    ...(isVideo ? { videoQuality: "720", youtubeVideoCodec: "h264" } : {}),
+  };
   const instances = [
-    { url: "https://apicobalt.mgytr.top", payload: { url: `https://www.youtube.com/watch?v=${videoId}`, downloadMode: isVideo ? "progressive" : "audio", audioFormat: "best", ...(isVideo ? { videoQuality: "720" } : {}) } },
-    { url: "https://cobalt.alpha.wolfy.love", payload: { url: `https://www.youtube.com/watch?v=${videoId}`, downloadMode: isVideo ? "progressive" : "audio", audioFormat: "best", ...(isVideo ? { videoQuality: "720" } : {}) } },
-    { url: "https://lime.clxxped.lol", payload: { url: `https://www.youtube.com/watch?v=${videoId}`, downloadMode: isVideo ? "progressive" : "audio", audioFormat: "best", ...(isVideo ? { videoQuality: "720" } : {}) } },
-    { url: "https://api.qwkuns.me", payload: { url: `https://www.youtube.com/watch?v=${videoId}`, downloadMode: isVideo ? "progressive" : "audio", audioFormat: "best", ...(isVideo ? { videoQuality: "720" } : {}) } },
+    { url: "https://apicobalt.mgytr.top", payload: basePayload },
+    { url: "https://cobalt.alpha.wolfy.love", payload: basePayload },
+    { url: "https://api.qwkuns.me", payload: basePayload },
+    { url: "https://lime.clxxped.lol", payload: basePayload },
+    { url: "https://cobalt-api.hyper.lol", payload: basePayload },
+    { url: "https://cobalt.api.timelessnesses.me", payload: basePayload },
+    { url: "https://api-dl.cgm.rs", payload: basePayload },
+    { url: "https://cobalt.synzr.space", payload: basePayload },
+    { url: "https://capi.oak.li", payload: basePayload },
+    { url: "https://co.tskau.team", payload: basePayload },
+    { url: "https://api.co.rooot.gay", payload: basePayload },
   ];
 
   for (const { url: instance, payload } of instances) {
@@ -395,6 +407,10 @@ async function resolveViaCobalt(videoId, isVideo = false) {
       if (res.data?.url) {
         console.log(`[stream] Cobalt success for ${videoId} (${instance})`);
         return res.data.url;
+      }
+      if (res.data?.status === "local-processing" && res.data?.tunnel?.length) {
+        console.log(`[stream] Cobalt local-processing for ${videoId} (${instance})`);
+        return res.data.tunnel[0];
       }
     } catch (err) {
       console.warn(`[stream] Cobalt ${instance} failed: ${err.message}`);
