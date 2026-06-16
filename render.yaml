@@ -7,3 +7,5 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20.0.0
+      - key: INNERTUBE_CLIENT
+        value: ANDROID_VR

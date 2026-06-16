@@ -13,9 +13,12 @@ let spotifyToken = null;
 let spotifyTokenExpiry = 0;
 let spotifyDown = false;
 let spotifyDownChecked = 0;
+let spotifyDisabled = false;
 const SPOTIFY_RETRY_AFTER = 5 * 60 * 1000; // 5 min antes de reintentar
 
 async function getSpotifyToken() {
+  if (spotifyDisabled && Date.now() - spotifyDownChecked < SPOTIFY_RETRY_AFTER) return null;
+  spotifyDisabled = false;
   if (spotifyToken && Date.now() < spotifyTokenExpiry) return spotifyToken;
   try {
     const res = await axios.post("https://accounts.spotify.com/api/token",
@@ -32,18 +35,35 @@ async function getSpotifyToken() {
     spotifyTokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
     return spotifyToken;
   } catch (err) {
-    console.error("[Spotify API] Token error:", err.message);
-    throw err;
+    if (err.response?.status === 403) {
+      console.warn("[Spotify API] 403 Forbidden on token retrieval. Will retry after 5 min.");
+      spotifyDisabled = true;
+      spotifyDownChecked = Date.now();
+    } else {
+      console.error("[Spotify API] Token error:", err.message);
+    }
+    return null;
   }
 }
 
 async function spotifyFetch(endpoint) {
+  if (spotifyDisabled) throw new Error("Spotify API integration is disabled.");
   const token = await getSpotifyToken();
-  const res = await axios.get(`https://api.spotify.com/v1${endpoint}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    timeout: 10000,
-  });
-  return res.data;
+  if (!token) throw new Error("No Spotify token available.");
+  
+  try {
+    const res = await axios.get(`https://api.spotify.com/v1${endpoint}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 10000,
+    });
+    return res.data;
+  } catch (err) {
+    if (err.response?.status === 403) {
+      console.warn("[Spotify API] 403 Forbidden on fetch request. Disabling Spotify API client integration.");
+      spotifyDisabled = true;
+    }
+    throw err;
+  }
 }
 
 async function searchArtistsDirect(query, limit = 5) {

@@ -89,12 +89,16 @@ GET /api/proxy/audio?url=<encoded_url>
 → Audio binario (streaming)
 
 ====================================================================
-5. LETRAS (LRCLib)
+5. LETRAS (BetterLyrics / LRCLib / Genius)
 ====================================================================
 GET /api/lyrics?track=<titulo>&artist=<artista>&album=<album>
+               &source=<Automatico|betterlyrics|lrclib|genius>
+               &enabled_providers=betterlyrics,lrclib,genius
+               &romanize_japanese=true|false
+               &romanize_korean=true|false
 → {
     "found": true,
-    "source": "lrclib",
+    "source": "betterlyrics",
     "synced": [{"time": 12.34, "text": "Lyric line"}],
     "plain": "Letra completa...",
     "trackName": "...",

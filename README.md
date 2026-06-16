@@ -18,7 +18,7 @@ Backend API para Android Music App. Búsqueda y streaming de música con InnerTu
 |---|---|---|
 | `GET /api/search` | Búsqueda musical (InnerTube → Lavalink) | ~1s |
 | `GET /api/stream` | Resolver URL de audio (InnerTube → yt-dlp → Invidious) | ~1s |
-| `GET /api/lyrics` | Letras sincronizadas (LRCLib) | ~1s |
+| `GET /api/lyrics` | Letras sincronizadas (BetterLyrics / LRCLib / Genius) | ~1s |
 | `GET /api/search/suggestions` | Autocomplete | <500ms |
 | `GET /api/artist/info` | Info de artista (Deezer + Wikipedia) | ~2s |
 | `POST /api/metadata/enrich` | Enriquecer metadatos de tracks | ~3s |
@@ -43,6 +43,10 @@ Ver `API_ENDPOINTS.txt` para documentación detallada.
 - **Cache**: player por 6h, search por 60s, suggestions por 60s
 - **Refresh**: config de InnerTube cada 30min
 - **Geo-blocking**: detectado y reportado como 403 `{ blocked: true }`
+
+### InnerTube client
+
+Fijado por defecto a `INNERTUBE_CLIENT=ANDROID_VR` para probar el arranque más rápido.
 
 ## Setup
 

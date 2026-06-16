@@ -117,6 +117,39 @@ function cleanAuthor(author) {
   return (author || "").replace(/\s*-\s*Topic$/i, "").trim();
 }
 
+// ── Event Tracking ─────────────────────────────────────────────────────────
+const eventSchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  sessionId: { type: String, required: true },
+  event: {
+    type: String,
+    enum: ["impression", "play", "skip", "dwell"],
+    required: true,
+  },
+  sectionType: { type: String, required: true },
+  reasonKey: String,
+  itemId: String,
+  dwellMs: Number,
+  timestamp: { type: Date, default: Date.now },
+});
+eventSchema.index({ userId: 1, timestamp: -1 });
+eventSchema.index({ reasonKey: 1, timestamp: -1 });
+eventSchema.index({ sessionId: 1 });
+
+const rulePerformanceSchema = new mongoose.Schema({
+  reasonKey: { type: String, unique: true, required: true },
+  totalImpressions: { type: Number, default: 0 },
+  totalPlays: { type: Number, default: 0 },
+  totalSkips: { type: Number, default: 0 },
+  totalDwellMs: { type: Number, default: 0 },
+  totalDwellEvents: { type: Number, default: 0 },
+  ctr: { type: Number, default: 0 },
+  playRate: { type: Number, default: 0 },
+  skipRate: { type: Number, default: 0 },
+  avgDwellMs: { type: Number, default: 0 },
+  updatedAt: { type: Date, default: Date.now },
+});
+
 // ── Android connection (default) ───────────────────────────────────────
 const UserStats = mongoose.model("UserStats", userStatsSchema);
 const Playlist = mongoose.model("Playlist", playlistSchema);
@@ -127,6 +160,8 @@ const DislikedSong = mongoose.model("DislikedSong", dislikedSongSchema);
 const LikedAlbum = mongoose.model("LikedAlbum", likedAlbumSchema);
 const FollowedArtist = mongoose.model("FollowedArtist", followedArtistSchema);
 const MetadataPool = mongoose.model("MetadataPool", metadataPoolSchema);
+const Event = mongoose.model("Event", eventSchema);
+const RulePerformance = mongoose.model("RulePerformance", rulePerformanceSchema);
 
 // ── Discord connection (separate DB) ──────────────────────────────────
 const discordUri = process.env.DISCORD_MONGODB_URI;
@@ -142,6 +177,8 @@ let DiscordDislikedSong = null;
 let DiscordLikedAlbum = null;
 let DiscordFollowedArtist = null;
 let DiscordMetadataPool = null;
+let DiscordEvent = null;
+let DiscordRulePerformance = null;
 
 if (discordConn) {
   DiscordUser = discordConn.model("User", userSchema);
@@ -154,6 +191,8 @@ if (discordConn) {
   DiscordLikedAlbum = discordConn.model("LikedAlbum", likedAlbumSchema);
   DiscordFollowedArtist = discordConn.model("FollowedArtist", followedArtistSchema);
   DiscordMetadataPool = discordConn.model("MetadataPool", metadataPoolSchema);
+  DiscordEvent = discordConn.model("Event", eventSchema);
+  DiscordRulePerformance = discordConn.model("RulePerformance", rulePerformanceSchema);
 }
 
 function getModels(source) {
@@ -168,9 +207,15 @@ function getModels(source) {
       LikedAlbum: DiscordLikedAlbum,
       FollowedArtist: DiscordFollowedArtist,
       MetadataPool: DiscordMetadataPool,
+      Event: DiscordEvent,
+      RulePerformance: DiscordRulePerformance,
     };
   }
-  return { UserStats, Playlist, History, LikedSong, TrackPlay, DislikedSong, LikedAlbum, FollowedArtist, MetadataPool };
+  return {
+    UserStats, Playlist, History, LikedSong, TrackPlay,
+    DislikedSong, LikedAlbum, FollowedArtist, MetadataPool,
+    Event, RulePerformance,
+  };
 }
 
 // ── Init DB ─────────────────────────────────────────────────────────────
@@ -1141,6 +1186,84 @@ async function syncHistory(userId, historyEntries, source = "android") {
   }));
 }
 
+// ── Event Tracking CRUD ─────────────────────────────────────────────────────
+async function recordEvent(eventData) {
+  const { Event } = getModels(eventData.source || "android");
+  await whenReady(() => {});
+  try {
+    await Event.create({
+      userId: eventData.userId,
+      sessionId: eventData.sessionId,
+      event: eventData.event,
+      sectionType: eventData.sectionType,
+      reasonKey: eventData.reasonKey || null,
+      itemId: eventData.itemId || null,
+      dwellMs: eventData.dwellMs || 0,
+    });
+    return true;
+  } catch (err) {
+    console.warn("[DB] recordEvent error:", err.message);
+    return false;
+  }
+}
+
+async function getEvents(filter, limit = 1000) {
+  const { Event } = getModels(filter.source || "android");
+  await whenReady(() => {});
+  const query = {};
+  if (filter.userId) query.userId = filter.userId;
+  if (filter.reasonKey) query.reasonKey = filter.reasonKey;
+  if (filter.event) query.event = filter.event;
+  if (filter.since) query.timestamp = { $gte: new Date(filter.since) };
+  return Event.find(query).sort({ timestamp: -1 }).limit(limit).lean();
+}
+
+function getRulePerformanceModel(source) {
+  return getModels(source).RulePerformance;
+}
+
+async function upsertRulePerformance(reasonKey, metrics) {
+  const RulePerformance = getRulePerformanceModel();
+  await whenReady(() => {});
+  const setFields = {
+    ...metrics,
+    updatedAt: new Date(),
+  };
+  return RulePerformance.findOneAndUpdate(
+    { reasonKey },
+    { $set: setFields },
+    { upsert: true, new: true }
+  );
+}
+
+async function getRulePerformance(reasonKey) {
+  const RulePerformance = getRulePerformanceModel();
+  await whenReady(() => {});
+  if (reasonKey) {
+    return RulePerformance.findOne({ reasonKey }).lean();
+  }
+  return RulePerformance.find().sort({ ctr: -1 }).lean();
+}
+
+async function getEventAggregates(since) {
+  const Event = getModels().Event;
+  await whenReady(() => {});
+  const match = since ? { timestamp: { $gte: new Date(since) } } : {};
+  return Event.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: "$reasonKey",
+        impressions: { $sum: { $cond: [{ $eq: ["$event", "impression"] }, 1, 0] } },
+        plays: { $sum: { $cond: [{ $eq: ["$event", "play"] }, 1, 0] } },
+        skips: { $sum: { $cond: [{ $eq: ["$event", "skip"] }, 1, 0] } },
+        totalDwellMs: { $sum: { $cond: [{ $eq: ["$event", "dwell"] }, "$dwellMs", 0] } },
+        dwellEvents: { $sum: { $cond: [{ $eq: ["$event", "dwell"] }, 1, 0] } },
+      },
+    },
+  ]);
+}
+
 module.exports = {
   initDB,
   updateUserStats,
@@ -1195,4 +1318,9 @@ module.exports = {
   getRecentPlayback,
   clearRecentPlayback,
   syncUserData,
+  recordEvent,
+  getEvents,
+  upsertRulePerformance,
+  getRulePerformance,
+  getEventAggregates,
 };

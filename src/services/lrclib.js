@@ -1,5 +1,6 @@
 const axios = require("axios");
 const https = require("https");
+const betterLyrics = require("./betterlyrics");
 
 const LRCLIB_URL = "https://lrclib.net/api";
 
@@ -142,38 +143,126 @@ async function searchGenius(trackName, artistName) {
   }
 }
 
-async function getLyrics(trackName, artistName, albumName = "") {
-  const cleanArtist = (artistName || "").replace(/\s*-\s*Topic$/, "");
-  let lrclibResult = await searchLRCLib(trackName, cleanArtist, albumName);
+async function getLyrics(trackName, artistName, albumName = "", options = {}) {
+  const source = (options.source || "").toString().trim().toLowerCase();
+  const enabledProviders = normalizeEnabledProviders(options.enabledProviders);
 
-  if (!lrclibResult && trackName) {
-    const cleanTrack = trackName.replace(/\([^)]*\)/g, "").replace(/\[[^\]]*\]/g, "").replace(/-\s*(Topic|Lyrics|Official|Video|Audio|HD|HQ)/gi, "").replace(/\(\s*Topic\s*\)/gi, "").replace(/\s+/g, " ").trim();
-    if (cleanTrack !== trackName) {
-      lrclibResult = await searchLRCLib(cleanTrack, cleanArtist);
+  const cleanArtist = (artistName || "").replace(/\s*-\s*Topic$/, "");
+  const providerOrder = buildProviderOrder(source, enabledProviders);
+
+  for (const provider of providerOrder) {
+    if (provider === "betterlyrics") {
+      const result = await betterLyrics.getLyrics(trackName, cleanArtist, albumName);
+      if (result) return normalizeLyricsResult(result);
+      continue;
+    }
+
+    if (provider === "lrclib") {
+      let lrclibResult = await searchLRCLib(trackName, cleanArtist, albumName);
+
+      if (!lrclibResult && trackName) {
+        const cleanTrack = trackName.replace(/\([^)]*\)/g, "").replace(/\[[^\]]*\]/g, "").replace(/-\s*(Topic|Lyrics|Official|Video|Audio|HD|HQ)/gi, "").replace(/\(\s*Topic\s*\)/gi, "").replace(/\s+/g, " ").trim();
+        if (cleanTrack !== trackName) {
+          lrclibResult = await searchLRCLib(cleanTrack, cleanArtist);
+        }
+      }
+
+      if (!lrclibResult && trackName) {
+        lrclibResult = await searchLRCLib(trackName);
+      }
+
+      if (lrclibResult) {
+        return normalizeLyricsResult({ found: true, source: "lrclib", ...lrclibResult });
+      }
+      continue;
+    }
+
+    if (provider === "genius") {
+      const geniusResult = await searchGenius(trackName, cleanArtist);
+      if (geniusResult) {
+        return normalizeLyricsResult({
+          found: true,
+          source: "genius",
+          synced: null,
+          plain: geniusResult.plain,
+          trackName: geniusResult.trackName,
+          artistName: geniusResult.artistName,
+        });
+      }
     }
   }
 
-  if (!lrclibResult && trackName) {
-    lrclibResult = await searchLRCLib(trackName);
-  }
-
-  if (lrclibResult) {
-    return { found: true, source: "lrclib", ...lrclibResult };
-  }
-
-  const geniusResult = await searchGenius(trackName, cleanArtist);
-  if (geniusResult) {
-    return {
-      found: true,
-      source: "genius",
-      synced: null,
-      plain: geniusResult.plain,
-      trackName: geniusResult.trackName,
-      artistName: geniusResult.artistName,
-    };
-  }
-
   return { found: false, synced: null, plain: null };
+}
+
+function normalizeLyricsResult(result) {
+  if (!result) return { found: false, synced: null, plain: null };
+
+  const synced = Array.isArray(result.synced)
+    ? result.synced
+        .map((line) => {
+          const time = Number(line?.time);
+          const text = line?.text;
+          if (!Number.isFinite(time) || text == null) return null;
+          const words = Array.isArray(line?.words)
+            ? line.words
+                .map((word) => {
+                  const wordTime = Number(word?.time);
+                  const wordText = word?.text;
+                  if (!Number.isFinite(wordTime) || wordText == null) return null;
+                  const normalized = { time: wordTime, text: String(wordText) };
+                  if (word?.endTime != null && Number.isFinite(Number(word.endTime))) {
+                    normalized.endTime = Number(word.endTime);
+                  }
+                  return normalized;
+                })
+                .filter(Boolean)
+            : null;
+          const normalized = { time, text: String(text) };
+          if (words && words.length) normalized.words = words;
+          if (line?.endTime != null && Number.isFinite(Number(line.endTime))) {
+            normalized.endTime = Number(line.endTime);
+          }
+          return normalized;
+        })
+        .filter(Boolean)
+    : null;
+
+  return {
+    found: Boolean(result.found),
+    source: result.source != null ? String(result.source) : null,
+    synced: synced && synced.length ? synced : null,
+    plain: result.plain != null ? String(result.plain) : null,
+    trackName: result.trackName != null ? String(result.trackName) : null,
+    artistName: result.artistName != null ? String(result.artistName) : null,
+    duration: result.duration,
+  };
+}
+
+function normalizeEnabledProviders(enabledProviders) {
+  if (!enabledProviders) return null;
+  if (Array.isArray(enabledProviders)) {
+    return enabledProviders.map((v) => String(v).toLowerCase().trim()).filter(Boolean);
+  }
+  if (typeof enabledProviders === "string") {
+    return enabledProviders.split(",").map((v) => String(v).toLowerCase().trim()).filter(Boolean);
+  }
+  return null;
+}
+
+function buildProviderOrder(source, enabledProviders) {
+  const allProviders = ["betterlyrics", "lrclib", "genius"];
+  const enabledProvided = enabledProviders !== null && enabledProviders !== undefined;
+  const enabledSet = enabledProvided ? new Set(enabledProviders) : null;
+  const enabledOrder = enabledProvided ? allProviders.filter((provider) => enabledSet.has(provider)) : allProviders;
+
+  if (source && source !== "automatico" && source !== "auto") {
+    const requested = source.toLowerCase();
+    if (enabledProvided && !enabledSet.has(requested)) return enabledOrder;
+    return [requested, ...enabledOrder.filter((provider) => provider !== requested)];
+  }
+
+  return enabledOrder;
 }
 
 /**

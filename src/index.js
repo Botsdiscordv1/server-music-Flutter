@@ -23,13 +23,22 @@ async function main() {
   });
 
   // 3. Iniciar Servidor Express
-  const server = musicApi.listen(PORT, () => {
-    console.log(`[SERVER] Running on port ${PORT}`);
-  });
-  server.on("error", (err) => {
-    console.error(`[SERVER] Failed to start on port ${PORT}:`, err.message);
-    process.exit(1);
-  });
+  function startServer(attempt = 1) {
+    const server = musicApi.listen(PORT, () => {
+      console.log(`[SERVER] Running on port ${PORT}`);
+    });
+    server.on("error", (err) => {
+      if (err.code === "EADDRINUSE" && attempt < 5) {
+        console.log(`[SERVER] Port ${PORT} in use, retrying in 1s (attempt ${attempt})...`);
+        setTimeout(() => startServer(attempt + 1), 1000);
+      } else {
+        console.error(`[SERVER] Failed to start on port ${PORT}:`, err.message);
+        process.exit(1);
+      }
+    });
+    return server;
+  }
+  let server = startServer();
 
   // 4. TTS Keepalive (Opcional, si está configurado)
   const ttsProvider = (process.env.TTS_PROVIDER || "google").toLowerCase();
@@ -47,5 +56,11 @@ async function main() {
 
 process.on("uncaughtException", (err) => console.error("❌ Uncaught:", err.message));
 process.on("unhandledRejection", (reason) => console.error("❌ Unhandled:", reason?.message || reason));
+
+process.on("SIGTERM", () => {
+  console.log("[SERVER] SIGTERM received, closing server...");
+  if (server && server.close) server.close(() => process.exit(0));
+  else process.exit(0);
+});
 
 main().catch(console.error);

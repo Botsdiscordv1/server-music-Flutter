@@ -5,7 +5,7 @@ const passport = require("passport");
 const DiscordStrategy = require("passport-discord").Strategy;
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const User = require("../models/User");
-const { requireApiKey, requireAuth } = require("./middleware/auth");
+const { requireApiKey, requireAuth, extractYtmCookies } = require("./middleware/auth");
 const db = require("../database");
 const { DiscordUser } = db;
 const {
@@ -19,6 +19,10 @@ const { getLyrics } = require("../services/lrclib");
 const spotify = require("../services/spotify");
 const innertube = require("../services/innertube");
 const metadataEnricher = require("../services/metadataEnricher");
+const homeAggregatorService = require("../services/homeAggregatorService");
+const radioService = require("../services/radioService");
+const eventCollectorService = require("../services/eventCollectorService");
+const rulePerformanceStore = require("../services/rulePerformanceStore");
 
 const axios = require("axios");
 const play = require("play-dl");
@@ -52,7 +56,9 @@ if (fs.existsSync(COOKIES_PATH)) {
       }
     }
     if (cookies.length) {
-      play.setToken({ youtube: { cookie: cookies.join("; ") } });
+      const cookieStr = cookies.join("; ");
+      play.setToken({ youtube: { cookie: cookieStr } });
+      innertube.setCookies(cookieStr);
       hasYtCookies = true;
       console.log(`[COOKIES] YouTube configured with ${cookies.length} cookies`);
     }
@@ -184,9 +190,21 @@ const { getCached, setCached } = (() => {
 const searchCache = new Map();
 const SEARCH_CACHE_TTL = 5 * 60 * 1000;  // 5 min
 const SEARCH_CACHE_MAX = 50;              // máx 50 búsquedas
+const searchInFlight = new Map();
 const artistInfoCache = new Map();
 const ARTIST_INFO_CACHE_TTL = 60 * 60 * 1000;  // 1 hora
 const ARTIST_INFO_CACHE_MAX = 200;
+const artistInfoInFlight = new Map();
+const artistImageCache = new Map();
+const ARTIST_IMAGE_CACHE_TTL = 60 * 60 * 1000;
+const artistImageInFlight = new Map();
+const suggestionsInFlight = new Map();
+const metadataPoolCache = new Map();
+const METADATA_POOL_CACHE_TTL = 2 * 60 * 1000;
+const metadataPoolInFlight = new Map();
+const metadataSyncCache = new Map();
+const METADATA_SYNC_CACHE_TTL = 30_000;
+const metadataSyncInFlight = new Map();
 function cleanCache(cache, ttl, max) {
   const now = Date.now();
   for (const [key, entry] of cache) {
@@ -195,6 +213,17 @@ function cleanCache(cache, ttl, max) {
   if (cache.size > max) {
     const entries = [...cache.entries()].sort((a, b) => a[1].ts - b[1].ts);
     for (let i = 0; i < entries.length - max; i++) cache.delete(entries[i][0]);
+  }
+}
+
+async function withInFlight(map, key, task) {
+  if (map.has(key)) return map.get(key);
+  const promise = Promise.resolve().then(task);
+  map.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    map.delete(key);
   }
 }
 setInterval(() => cleanCache(searchCache, SEARCH_CACHE_TTL, SEARCH_CACHE_MAX), 60_000);
@@ -308,19 +337,17 @@ async function resolveStreamUrl(identifier, req = null, forceRefresh = false, is
 async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
   const cacheKey = isVideo ? `${videoId}:video` : videoId;
 
-  // A. InnerTube directo (fallback principal en Render, YouTube bloquea IPs de datacenter)
-  if (IS_RENDER) {
-    try {
-      const streamUrl = await innertube.getStreamUrl(videoId);
-      if (streamUrl) {
-        console.log(`[stream] InnerTube success for ${videoId}`);
-        setCached(cacheKey, streamUrl);
-        return streamUrl;
-      }
-      console.warn(`[stream] InnerTube returned null for ${videoId} (no streaming data)`);
-    } catch (e) {
-      console.warn(`[stream] InnerTube failed for ${videoId}: ${e.message}`);
+  // A. InnerTube directo primero: suele responder antes que yt-dlp/play-dl
+  try {
+    const streamUrl = await innertube.getStreamUrl(videoId);
+    if (streamUrl) {
+      console.log(`[stream] InnerTube success for ${videoId}`);
+      setCached(cacheKey, streamUrl);
+      return streamUrl;
     }
+    console.warn(`[stream] InnerTube returned null for ${videoId} (no streaming data)`);
+  } catch (e) {
+    console.warn(`[stream] InnerTube failed for ${videoId}: ${e.message}`);
   }
 
   // B. yt-dlp (no funciona en Render sin cookies, YouTube bloquea IPs de datacenter)
@@ -432,7 +459,15 @@ app.use(passport.initialize());
 
 // Logger simple para debug en Render
 app.use((req, res, next) => {
-  console.log(`[${req.method}] ${req.url}`);
+  const cookie = req.headers["cookie"];
+  const ytm = req.headers["x-ytm-active"];
+  const sapisid = req.headers["x-ytm-sapisid"];
+  const auth = req.headers.authorization ? req.headers.authorization.substring(0, 30) + "..." : null;
+  if (cookie || ytm || sapisid) {
+    console.log(`[REQ] ${req.method} ${req.url} cookies=${(cookie?.length || 0)}b ytmActive=${ytm} sapisid=${!!sapisid} auth=${auth ? "Bearer.." : "none"} hasYtmCookies=${cookie && (cookie.includes("SAPISID") || cookie.includes("SSID"))}`);
+  } else {
+    console.log(`[${req.method}] ${req.url}`);
+  }
   next();
 });
 
@@ -514,37 +549,49 @@ app.get("/api/search", requireApiKey, async (req, res) => {
       return res.json(cached.data);
     }
 
-    // InnerTube directo para ytmsearch (sin hop a Lavalink, ~1s)
-    let tracks = [];
-    if (source === "ytmsearch") {
-      tracks = await innertube.searchQuery(q);
-    }
-    // Fallback a Lavalink (catch silencioso si está caído)
-    if (!tracks.length) {
-      try {
-        tracks = await searchLavalink(source, q);
-      } catch (e) {
-        tracks = [];
+    const result = await withInFlight(searchInFlight, cacheKey, async () => {
+      const existing = searchCache.get(cacheKey);
+      if (existing && Date.now() - existing.ts < SEARCH_CACHE_TTL) {
+        return existing.data;
       }
-    }
 
-    if (!tracks.length) return res.json({ query: q, source, tracks: [] });
-
-    const result = { query: q, source, tracks };
-    searchCache.set(cacheKey, { data: result, ts: Date.now() });
-    res.json(result);
-
-    // Background: enriquecer con Lavalink (encoded, isrc, explicit) + pre-resolver streams
-    setImmediate(async () => {
-      if (!IS_RENDER) {
-        const toResolve = result.tracks.slice(0, 3);
-        for (const track of toResolve) {
-          if (track.uri) {
-            try { await resolveStreamUrl(track.uri, req); } catch (e) {}
-          }
+      // InnerTube directo para ytmsearch (sin hop a Lavalink, ~1s)
+      let tracks = [];
+      if (source === "ytmsearch") {
+        tracks = await innertube.searchQuery(q);
+      }
+      // Fallback a Lavalink (catch silencioso si está caído)
+      if (!tracks.length) {
+        try {
+          tracks = await searchLavalink(source, q);
+        } catch (e) {
+          tracks = [];
         }
       }
+
+      if (!tracks.length) return { query: q, source, tracks: [] };
+
+      tracks = await enrichArtworkWithDeezer(tracks);
+
+      const payload = { query: q, source, tracks };
+      searchCache.set(cacheKey, { data: payload, ts: Date.now() });
+
+      // Background: enriquecer con Lavalink (encoded, isrc, explicit) + pre-resolver streams
+      setImmediate(async () => {
+        if (!IS_RENDER) {
+          const toResolve = payload.tracks.slice(0, 3);
+          for (const track of toResolve) {
+            if (track.uri) {
+              try { await resolveStreamUrl(track.uri, req); } catch (e) {}
+            }
+          }
+        }
+      });
+
+      return payload;
     });
+
+    res.json(result);
   } catch (err) {
     console.error("Search Error:", err.message);
     res.status(500).json({ error: err.message });
@@ -567,14 +614,23 @@ app.get("/api/search/suggestions", requireApiKey, async (req, res) => {
       return res.json(cached.data);
     }
 
-    const sugRes = await axios.get("https://suggestqueries.google.com/complete/search", {
-      params: { client: "chrome", ds: "yt", q: q.trim() },
-      timeout: 5000,
+    const result = await withInFlight(suggestionsInFlight, cacheKey, async () => {
+      const existing = searchCache.get(cacheKey);
+      if (existing && Date.now() - existing.ts < 60_000) {
+        return existing.data;
+      }
+
+      const sugRes = await axios.get("https://suggestqueries.google.com/complete/search", {
+        params: { client: "chrome", ds: "yt", q: q.trim() },
+        timeout: 5000,
+      });
+
+      const suggestions = Array.isArray(sugRes.data?.[1]) ? sugRes.data[1] : [];
+      const payload = { query: q, suggestions };
+      searchCache.set(cacheKey, { data: payload, ts: Date.now() });
+      return payload;
     });
 
-    const suggestions = Array.isArray(sugRes.data?.[1]) ? sugRes.data[1] : [];
-    const result = { query: q, suggestions };
-    searchCache.set(cacheKey, { data: result, ts: Date.now() });
     res.json(result);
   } catch (err) {
     console.error("[suggestions] Error:", err.message);
@@ -635,37 +691,66 @@ function enrichArtistNameSimilar(a, b) {
   return inter / new Set([...sa, ...sb]).size;
 }
 
+function hasRemixTag(text) {
+  return /\b(remix|rework|edit|mix|live|acoustic)\b/i.test(text || "");
+}
+
+function scoreDeezerCandidate(track, candidate) {
+  const trackArtist = track.artist || "";
+  const candidateArtist = candidate.artist?.name || "";
+  const trackTitle = metadataEnricher.cleanTitle(track.title || "").toLowerCase();
+  const candidateTitle = metadataEnricher.cleanTitle(candidate.title || "").toLowerCase();
+
+  let score = 0;
+  score += enrichArtistNameSimilar(candidateArtist, trackArtist) * 10;
+
+  if (trackTitle && candidateTitle) {
+    if (trackTitle === candidateTitle) score += 8;
+    else if (trackTitle.includes(candidateTitle) || candidateTitle.includes(trackTitle)) score += 4;
+    else {
+      const trackWords = new Set(trackTitle.split(/\s+/).filter(Boolean));
+      const candidateWords = new Set(candidateTitle.split(/\s+/).filter(Boolean));
+      let shared = 0;
+      for (const word of trackWords) if (candidateWords.has(word)) shared++;
+      score += Math.min(shared, 4);
+    }
+  }
+
+  const trackIsVariant = hasRemixTag(track.title);
+  const candidateIsVariant = hasRemixTag(candidate.title || candidate.album?.title || "");
+  if (trackIsVariant === candidateIsVariant) score += 3;
+  else if (trackIsVariant || candidateIsVariant) score -= 6;
+
+  if (candidate.explicit_lyrics === true) score += 0.5;
+  return score;
+}
+
 async function enrichArtworkWithDeezer(tracks) {
   const enriched = [...tracks];
   const limit = Math.min(enriched.length, 6);
-  for (let i = 0; i < limit; i++) {
-    const track = enriched[i];
+  const lookups = enriched.slice(0, limit).map(async (track) => {
     const needsArtwork = !track.artworkUrl?.startsWith("http") || track.artworkUrl?.includes("ytimg");
-    if (!needsArtwork && track.explicit !== undefined) continue;
+    if (!needsArtwork && track.explicit === true) return;
+    if (!track.title && !track.artist) return;
+
     try {
-      const q = encodeURIComponent(`${track.artist} ${track.title}`);
+      const q = encodeURIComponent(`${track.artist} ${track.title}`.trim());
       const res = await axios.get(`https://api.deezer.com/search/track?q=${q}&limit=3`, { timeout: 3000 });
       const data = res.data?.data || [];
-      // Validar que el artista coincida antes de aceptar artwork
-      let match = null;
-      const trackArtist = track.artist || "";
-      for (const d of data) {
-        const deezerArtist = d.artist?.name || "";
-        if (enrichArtistNameSimilar(deezerArtist, trackArtist) >= 0.25) {
-          match = d;
-          break;
-        }
-      }
-      if (!match) match = data[0]; // último recurso
+      // Elegir la coincidencia más parecida y evitar que el remix gane al original.
+      const match = data
+        .map((candidate) => ({ candidate, score: scoreDeezerCandidate(track, candidate) }))
+        .sort((a, b) => b.score - a.score)[0]?.candidate || null;
       if (match) {
         if (match.album?.cover_medium) {
           track.artworkUrl = match.album.cover_medium;
           track.thumbnail = match.album.cover_medium;
         }
-        if (match.explicit_lyrics !== undefined) track.explicit = match.explicit_lyrics;
+        if (match.explicit_lyrics !== undefined) track.explicit = match.explicit_lyrics === true;
       }
     } catch (e) {}
-  }
+  });
+  await Promise.allSettled(lookups);
   return enriched;
 }
 
@@ -683,43 +768,52 @@ app.get("/api/search/video", requireApiKey, async (req, res) => {
       return res.json(cached.data);
     }
 
-    // InnerTube directo primero (evita Lavalink caído)
-    const innertubeResults = await innertube.searchQuery(q, "video");
-    let tracks;
-    if (innertubeResults && innertubeResults.length) {
-      tracks = innertubeResults.map((t) => {
-        let artworkUrl = t.artworkUrl || "";
-        if (artworkUrl.includes("ytimg.com")) {
-          artworkUrl = artworkUrl
-            .replace(/\/(hqdefault|mqdefault|sddefault|default|maxresdefault)(\.jpg(\?.*)?)?$/, "/maxresdefault.jpg");
-        }
-        return {
-          uri: t.uri,
-          artworkUrl,
-          author: t.artist || t.author || "",
-          title: t.title,
-        };
-      });
-    } else {
-      // Fallback Lavalink si InnerTube no devolvió nada
-      const raw = await searchLavalink("ytsearch", q);
-      tracks = raw.map((t) => {
-        let artworkUrl = t.artworkUrl || "";
-        if (artworkUrl.includes("ytimg.com")) {
-          artworkUrl = artworkUrl
-            .replace(/\/(hqdefault|mqdefault|sddefault|default|maxresdefault)(\.jpg(\?.*)?)?$/, "/maxresdefault.jpg");
-        }
-        return {
-          uri: t.uri,
-          artworkUrl,
-          author: t.author,
-          title: t.title,
-        };
-      });
-    }
+    const result = await withInFlight(searchInFlight, cacheKey, async () => {
+      const existing = searchCache.get(cacheKey);
+      if (existing && Date.now() - existing.ts < SEARCH_CACHE_TTL) {
+        return existing.data;
+      }
 
-    const result = { query: q, source: "ytsearch", tracks };
-    searchCache.set(cacheKey, { data: result, ts: Date.now() });
+      // InnerTube directo primero (evita Lavalink caído)
+      const innertubeResults = await innertube.searchQuery(q, "video");
+      let tracks;
+      if (innertubeResults && innertubeResults.length) {
+        tracks = innertubeResults.map((t) => {
+          let artworkUrl = t.artworkUrl || "";
+          if (artworkUrl.includes("ytimg.com")) {
+            artworkUrl = artworkUrl
+              .replace(/\/(hqdefault|mqdefault|sddefault|default|maxresdefault)(\.jpg(\?.*)?)?$/, "/maxresdefault.jpg");
+          }
+          return {
+            uri: t.uri,
+            artworkUrl,
+            author: t.artist || t.author || "",
+            title: t.title,
+          };
+        });
+      } else {
+        // Fallback Lavalink si InnerTube no devolvió nada
+        const raw = await searchLavalink("ytsearch", q);
+        tracks = raw.map((t) => {
+          let artworkUrl = t.artworkUrl || "";
+          if (artworkUrl.includes("ytimg.com")) {
+            artworkUrl = artworkUrl
+              .replace(/\/(hqdefault|mqdefault|sddefault|default|maxresdefault)(\.jpg(\?.*)?)?$/, "/maxresdefault.jpg");
+          }
+          return {
+            uri: t.uri,
+            artworkUrl,
+            author: t.author,
+            title: t.title,
+          };
+        });
+      }
+
+      const payload = { query: q, source: "ytsearch", tracks };
+      searchCache.set(cacheKey, { data: payload, ts: Date.now() });
+      return payload;
+    });
+
     res.json(result);
   } catch (err) {
     console.error("[search/video] Error:", err.message);
@@ -928,9 +1022,14 @@ app.post("/api/admin/migrate-liked-urls", requireApiKey, async (req, res) => {
 
 app.get("/api/lyrics", requireApiKey, async (req, res) => {
   try {
-    const { track, artist, album } = req.query;
+    const { track, artist, album, source, enabled_providers, romanize_japanese, romanize_korean } = req.query;
     if (!track) return res.status(400).json({ error: "Missing 'track' parameter" });
-    const result = await getLyrics(track, artist || "", album || "");
+    const result = await getLyrics(track, artist || "", album || "", {
+      source,
+      enabledProviders: enabled_providers,
+      romanizeJapanese: romanize_japanese,
+      romanizeKorean: romanize_korean,
+    });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1024,6 +1123,9 @@ app.post("/api/likes/:userId", requireApiKey, async (req, res) => {
     const added = await db.addLikedSong(userId, mockTrack, connSource);
     res.json({ added });
 
+    // Clear home cache for instant updates
+    homeAggregatorService.clearUserCache(userId, connSource);
+
     // Auto-enrich en background
     setImmediate(async () => {
       try {
@@ -1071,6 +1173,9 @@ app.delete("/api/likes/:userId", requireApiKey, async (req, res) => {
     const mockTrack = { info: { uri: trackUrl } };
     const removed = await db.removeLikedSongByTrack(userId, mockTrack, source);
     res.json({ removed });
+
+    // Clear home cache for instant updates
+    homeAggregatorService.clearUserCache(userId, source);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1192,6 +1297,40 @@ app.post("/api/playlists/:userId", requireApiKey, async (req, res) => {
   }
 });
 
+app.get("/api/playlist/:playlistId/tracks", requireApiKey, async (req, res) => {
+  try {
+    const playlistId = req.params.playlistId;
+    const userId = req.userId || req.query.userId || "guest";
+    if (!playlistId) return res.status(400).json({ error: "Missing playlistId" });
+
+    let tracks = [];
+    if (playlistId.startsWith("PL") || playlistId.startsWith("VL") || playlistId.startsWith("RD")) {
+      tracks = await innertube.getPlaylistTracks(playlistId, userId);
+    } else {
+      tracks = await spotify.getPlaylist(playlistId);
+    }
+    
+    res.json({ id: playlistId, tracks });
+  } catch (err) {
+    console.error("[playlist/tracks] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/album/:albumId", requireApiKey, async (req, res) => {
+  try {
+    const albumId = req.params.albumId;
+    const userId = req.userId || req.query.userId || "guest";
+    if (!albumId) return res.status(400).json({ error: "Missing albumId" });
+
+    const tracks = await innertube.getAlbumTracks(albumId, userId);
+    res.json({ id: albumId, tracks });
+  } catch (err) {
+    console.error("[album] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/artists/:userId", requireApiKey, async (req, res) => {
   try {
     const userId = req.userId || req.params.userId;
@@ -1224,8 +1363,25 @@ app.get("/api/artist-image", requireApiKey, async (req, res) => {
   try {
     const name = req.query.name;
     if (!name) return res.status(400).json({ error: "Missing 'name'" });
-    const info = await spotify.searchArtistDeezer(name);
-    res.json({ url: info?.image || null });
+    const cacheKey = name.trim().toLowerCase();
+    const cached = artistImageCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < ARTIST_IMAGE_CACHE_TTL) {
+      return res.json(cached.data);
+    }
+
+    const result = await withInFlight(artistImageInFlight, cacheKey, async () => {
+      const existing = artistImageCache.get(cacheKey);
+      if (existing && Date.now() - existing.ts < ARTIST_IMAGE_CACHE_TTL) {
+        return existing.data;
+      }
+
+      const info = await spotify.searchArtistDeezer(name);
+      const payload = { url: info?.image || null };
+      artistImageCache.set(cacheKey, { data: payload, ts: Date.now() });
+      return payload;
+    });
+
+    res.json(result);
   } catch (err) {
     res.json({ url: null });
   }
@@ -1261,34 +1417,42 @@ app.get("/api/artist/info", requireApiKey, async (req, res) => {
     const cached = artistInfoCache.get(name);
     if (cached) return res.json(cached);
 
-    const [deezerInfo, description, spotifyArtists] = await Promise.all([
-      spotify.searchArtistDeezer(name),
-      spotify.getArtistDescription(name),
-      spotify.searchArtistsDirect(name, 3).catch(() => []),
-    ]);
+    const result = await withInFlight(artistInfoInFlight, name, async () => {
+      const existing = artistInfoCache.get(name);
+      if (existing) return existing;
 
-    if (!deezerInfo && !description && !spotifyArtists.length) {
-      return res.status(404).json({ error: "Artist not found" });
-    }
+      const [deezerInfo, description, spotifyArtists] = await Promise.all([
+        spotify.searchArtistDeezer(name),
+        spotify.getArtistDescription(name),
+        spotify.searchArtistsDirect(name, 3).catch(() => []),
+      ]);
 
-    const spotifyArtist = spotifyArtists.find(a => a.name.toLowerCase() === name.toLowerCase())
-      || spotifyArtists[0];
+      if (!deezerInfo && !description && !spotifyArtists.length) {
+        return null;
+      }
 
-    const result = {
-      name: deezerInfo?.name || spotifyArtist?.name || name,
-      image: deezerInfo?.image || spotifyArtist?.image || null,
-      imageBig: deezerInfo?.imageBig || spotifyArtist?.image || null,
-      imageXl: deezerInfo?.imageXl || spotifyArtist?.image || null,
-      fans: deezerInfo?.fans || spotifyArtist?.followers || 0,
-      albums: deezerInfo?.albums || 0,
-      description: description?.description || null,
-      descriptionSource: description?.source || null,
-      descriptionUrl: description?.url || null,
-      source: "deezer+wikipedia",
-    };
+      const spotifyArtist = spotifyArtists.find(a => a.name.toLowerCase() === name.toLowerCase())
+        || spotifyArtists[0];
 
-    artistInfoCache.set(name, { ...result, ts: Date.now() });
-    console.log(`[artist/info] "${name}" → image:${result.image ? result.image.slice(0,60)+"..." : "null"} fans:${result.fans} desc:${result.description ? "✓" : "✗"} src:${result.descriptionSource || "none"}`);
+      const payload = {
+        name: deezerInfo?.name || spotifyArtist?.name || name,
+        image: deezerInfo?.image || spotifyArtist?.image || null,
+        imageBig: deezerInfo?.imageBig || spotifyArtist?.image || null,
+        imageXl: deezerInfo?.imageXl || spotifyArtist?.image || null,
+        fans: deezerInfo?.fans || spotifyArtist?.followers || 0,
+        albums: deezerInfo?.albums || 0,
+        description: description?.description || null,
+        descriptionSource: description?.source || null,
+        descriptionUrl: description?.url || null,
+        source: "deezer+wikipedia",
+      };
+
+      artistInfoCache.set(name, { ...payload, ts: Date.now() });
+      console.log(`[artist/info] "${name}" → image:${payload.image ? payload.image.slice(0,60)+"..." : "null"} fans:${payload.fans} desc:${payload.description ? "✓" : "✗"} src:${payload.descriptionSource || "none"}`);
+      return payload;
+    });
+
+    if (!result) return res.status(404).json({ error: "Artist not found" });
     res.json(result);
   } catch (err) {
     console.error("[artist/info] Error:", err.message);
@@ -1317,25 +1481,44 @@ app.get("/api/metadata/pool", requireApiKey, async (req, res) => {
   try {
     const { q, limit } = req.query;
     const connSource = req.provider || "android";
-    let results;
-    if (q) {
-      const fp = metadataEnricher.createFingerprint(q, q);
-      const byFp = await db.getMetadataPool(fp, connSource);
-      if (byFp) {
-        results = [byFp];
-      } else {
-        const filter = {
-          $or: [
-            { trackTitle: { $regex: q, $options: "i" } },
-            { trackAuthor: { $regex: q, $options: "i" } },
-          ]
-        };
-        results = await db.queryMetadataPool(filter, parseInt(limit) || 50, connSource);
-      }
-    } else {
-      results = await db.queryMetadataPool({}, parseInt(limit) || 50, connSource);
+
+    const cacheKey = `${connSource}:${q || ""}:${parseInt(limit) || 50}`;
+    const cached = metadataPoolCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < METADATA_POOL_CACHE_TTL) {
+      return res.json(cached.data);
     }
-    res.json({ count: results.length, entries: results });
+
+    const result = await withInFlight(metadataPoolInFlight, cacheKey, async () => {
+      const existing = metadataPoolCache.get(cacheKey);
+      if (existing && Date.now() - existing.ts < METADATA_POOL_CACHE_TTL) {
+        return existing.data;
+      }
+
+      let results;
+      if (q) {
+        const fp = metadataEnricher.createFingerprint(q, q);
+        const byFp = await db.getMetadataPool(fp, connSource);
+        if (byFp) {
+          results = [byFp];
+        } else {
+          const filter = {
+            $or: [
+              { trackTitle: { $regex: q, $options: "i" } },
+              { trackAuthor: { $regex: q, $options: "i" } },
+            ]
+          };
+          results = await db.queryMetadataPool(filter, parseInt(limit) || 50, connSource);
+        }
+      } else {
+        results = await db.queryMetadataPool({}, parseInt(limit) || 50, connSource);
+      }
+
+      const payload = { count: results.length, entries: results };
+      metadataPoolCache.set(cacheKey, { data: payload, ts: Date.now() });
+      return payload;
+    });
+
+    res.json(result);
   } catch (err) {
     console.error("[Metadata/Pool] Error:", err.message);
     res.status(500).json({ error: err.message });
@@ -1347,8 +1530,26 @@ app.get("/api/metadata/sync", requireApiKey, async (req, res) => {
     const { since } = req.query;
     const connSource = req.provider || "android";
     if (!since) return res.status(400).json({ error: "Missing 'since' query param (ISO timestamp)" });
-    const entries = await db.getMetadataPoolChangesSince(since, connSource);
-    res.json({ count: entries.length, entries });
+
+    const cacheKey = `${connSource}:${since}`;
+    const cached = metadataSyncCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < METADATA_SYNC_CACHE_TTL) {
+      return res.json(cached.data);
+    }
+
+    const result = await withInFlight(metadataSyncInFlight, cacheKey, async () => {
+      const existing = metadataSyncCache.get(cacheKey);
+      if (existing && Date.now() - existing.ts < METADATA_SYNC_CACHE_TTL) {
+        return existing.data;
+      }
+
+      const entries = await db.getMetadataPoolChangesSince(since, connSource);
+      const payload = { count: entries.length, entries };
+      metadataSyncCache.set(cacheKey, { data: payload, ts: Date.now() });
+      return payload;
+    });
+
+    res.json(result);
   } catch (err) {
     console.error("[Metadata/Sync] Error:", err.message);
     res.status(500).json({ error: err.message });
@@ -1386,6 +1587,48 @@ app.post("/api/admin/enrich-all-likes", requireApiKey, async (req, res) => {
   }
 });
 
+app.get("/api/home/sections", requireApiKey, async (req, res) => {
+  try {
+    const userId = req.userId || req.query.userId || "guest";
+    const source = req.provider || req.query.source || "android";
+    if (userId !== "guest") {
+      req.userId = userId;
+      const hasYtmCookies = !!(req.headers["x-ytm-cookie"] || req.headers["x-ytm-sapisid"] || req.headers["x-ytm-active"]);
+      extractYtmCookies(req);
+      if (hasYtmCookies) {
+        homeAggregatorService.clearUserCache(userId, source);
+        innertube.clearHomeFeedCache(userId);
+      }
+    }
+    const result = await homeAggregatorService.getHomeSections(userId, source);
+    res.json({ sections: result?.sections || [] });
+  } catch (err) {
+    console.error("Home sections error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/home", requireApiKey, async (req, res) => {
+  try {
+    const userId = req.userId || req.body.userId || "guest";
+    const source = req.provider || req.body.source || "android";
+    if (userId !== "guest") {
+      req.userId = userId;
+      const hasYtmCookies = !!(req.headers["x-ytm-cookie"] || req.headers["x-ytm-sapisid"] || req.headers["x-ytm-active"]);
+      extractYtmCookies(req);
+      if (hasYtmCookies) {
+        homeAggregatorService.clearUserCache(userId, source);
+        innertube.clearHomeFeedCache(userId);
+      }
+    }
+    const result = await homeAggregatorService.getHomeSections(userId, source);
+    res.json({ sections: result?.sections || [] });
+  } catch (err) {
+    console.error("Home POST error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/recommendations/:userId", requireApiKey, async (req, res) => {
   try {
     const userId = req.userId || req.params.userId;
@@ -1398,6 +1641,30 @@ app.get("/api/recommendations/:userId", requireApiKey, async (req, res) => {
     res.json({ tracks: recs });
   } catch (err) {
     res.json({ tracks: [] });
+  }
+});
+
+app.get("/api/radio/:userId", requireApiKey, async (req, res) => {
+  try {
+    const userId = req.userId || req.params.userId;
+    const source = req.provider || "android";
+    const mixes = await radioService.getMixes(userId, source);
+    res.json({ sections: mixes });
+  } catch (err) {
+    console.error("Radio Error:", err.stack || err.message);
+    res.status(500).json({ sections: [] });
+  }
+});
+
+app.get("/api/radio", requireApiKey, async (req, res) => {
+  try {
+    const userId = req.userId || req.query.userId || "guest";
+    const source = req.provider || req.query.source || "android";
+    const mixes = await radioService.getMixes(userId, source);
+    res.json({ sections: mixes });
+  } catch (err) {
+    console.error("Radio Error:", err.stack || err.message);
+    res.status(500).json({ sections: [] });
   }
 });
 
@@ -1442,6 +1709,9 @@ app.post("/api/recent-playback/:userId", requireApiKey, async (req, res) => {
     };
     await db.addRecentPlayback(userId, track, source);
     res.json({ added: true });
+
+    // Clear home cache for instant update of Listen Again/Quick Picks
+    homeAggregatorService.clearUserCache(userId, source);
   } catch (err) {
     console.error("Recent Playback Error:", err.stack);
     res.status(500).json({ error: err.message });
@@ -1750,7 +2020,11 @@ app.post("/api/auth/google", async (req, res) => {
       await user.save();
     }
 
-    // 2. Generar JWT y responder
+    // 2. Extraer cookies YTM si el cliente las envía en el body o headers
+    req.userId = user._id.toString();
+    extractYtmCookies(req);
+
+    // 3. Generar JWT y responder
     const token = signToken(user);
     res.json({ token, user: user.toPublicJSON() });
 
@@ -1780,6 +2054,64 @@ app.get("/api/auth/google/callback", (req, res, next) => {
 
     res.redirect(`${clientUrl}?token=${encodeURIComponent(token)}`);
   })(req, res, next);
+});
+
+// ── Event Tracking ─────────────────────────────────────────────────────────
+app.post("/api/events", requireApiKey, async (req, res) => {
+  try {
+    const body = req.body;
+    if (!body.userId && req.userId) body.userId = req.userId;
+    if (!body.source) body.source = req.provider || "android";
+
+    if (Array.isArray(body.events)) {
+      const result = await eventCollectorService.recordBatch(body.events);
+      return res.json(result);
+    }
+
+    const result = await eventCollectorService.recordEvent(body);
+    res.json(result);
+  } catch (err) {
+    console.error("[Events] Error:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/events/performance", requireApiKey, async (req, res) => {
+  try {
+    const { reasonKey } = req.query;
+
+    if (req.query.compute === "true") {
+      await rulePerformanceStore.maybeCompute();
+    }
+
+    const data = reasonKey
+      ? await rulePerformanceStore.getPerformanceByReasonKey(reasonKey)
+      : await rulePerformanceStore.getAllPerformance();
+
+    res.json({ metrics: data || [] });
+  } catch (err) {
+    console.error("[Events/Performance] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/ytm/validate", requireApiKey, async (req, res) => {
+  try {
+    const userId = req.userId;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+
+    const cookieStr = innertube.resolveCookieString(userId);
+    if (!cookieStr) return res.json({ valid: false, reason: "no_cookies" });
+
+    await innertube.apiRequest("browse", { browseId: "FEmusic_home" }, {}, userId, true);
+    res.json({ valid: true });
+  } catch (err) {
+    if (err.response?.status === 401 || err.response?.status === 403) {
+      return res.json({ valid: false, reason: "expired" });
+    }
+    console.error("[YTM Validate] Error:", err.message);
+    res.json({ valid: false, reason: "error" });
+  }
 });
 
 // Global error handler
