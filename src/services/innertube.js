@@ -33,8 +33,8 @@ const playlistTracksCache = new Map();
 const PLAYLIST_TRACKS_CACHE_TTL = 5 * 60 * 1000;
 const playlistTracksInFlight = new Map();
 
-function resolveClientConfig() {
-  switch (INNERTUBE_CLIENT) {
+function resolveClientConfig(clientName = INNERTUBE_CLIENT) {
+  switch ((clientName || INNERTUBE_CLIENT).toUpperCase()) {
     case "WEB_REMIX":
       return {
         clientName: "WEB_REMIX",
@@ -261,12 +261,13 @@ function startRefreshTimer() {
   if (refreshInterval.unref) refreshInterval.unref();
 }
 
-function buildContext(userId, includeAuth) {
+function buildContext(userId, includeAuth, clientOverride) {
+  const clientConfig = clientOverride || config;
   const dataSyncId = includeAuth ? resolveDataSyncId(userId) : null;
   return {
     client: {
-      clientName: config.clientName,
-      clientVersion: config.clientVersion,
+      clientName: clientConfig.clientName,
+      clientVersion: clientConfig.clientVersion,
       hl: config.hl,
       gl: config.gl,
       utcOffsetMinutes: -new Date().getTimezoneOffset(),
@@ -307,9 +308,10 @@ function generateSapisidHash(cookieStr, origin = YTM_BASE) {
   return `${timestamp}_${hash}`;
 }
 
-function buildHeaders(cookieString, userId, includeAuth) {
+function buildHeaders(cookieString, userId, includeAuth, clientOverride) {
+  const clientConfig = clientOverride || config;
   const h = {
-    "User-Agent": USER_AGENT,
+    "User-Agent": clientConfig.userAgent || USER_AGENT,
     "Accept-Language": "en-US",
     "Content-Type": "application/json",
     "X-Goog-Api-Format-Version": "1",
@@ -317,8 +319,8 @@ function buildHeaders(cookieString, userId, includeAuth) {
     "Origin": YTM_BASE,
     "Referer": `${YTM_BASE}/`,
     "X-Goog-AuthUser": "0",
-    "X-YouTube-Client-Name": String(config.clientNameValue),
-    "X-YouTube-Client-Version": config.clientVersion,
+    "X-YouTube-Client-Name": String(clientConfig.clientNameValue),
+    "X-YouTube-Client-Version": clientConfig.clientVersion,
     "X-Goog-Visitor-Id": resolveVisitorData(userId) || "",
   };
   const effective = cookieString || userCookieString;
@@ -337,16 +339,18 @@ function buildHeaders(cookieString, userId, includeAuth) {
   return h;
 }
 
-async function apiRequest(endpoint, data, query = {}, userId, includeAuth) {
+async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clientNameOverride) {
   checkRateLimit(endpoint);
   const cfg = await initialize();
+  const clientOverride = clientNameOverride ? resolveClientConfig(clientNameOverride) : null;
   const url = `${YTM_BASE}/youtubei/${cfg.apiVersion}/${endpoint}?${querystring.stringify({ alt: "json", key: cfg.apiKey || API_KEY, ...query })}`;
-  const body = { ...data, context: buildContext(userId, includeAuth) };
+  const body = { ...data, context: buildContext(userId, includeAuth, clientOverride) };
   const cookieString = resolveCookieString(userId);
-  console.log(`[InnerTube] apiRequest endpoint=${endpoint} cookieLen=${cookieString ? cookieString.length : 0} perUserCookies=${!!(userId && userCookiesMap.has(userId))} includeAuth=${!!includeAuth}`);
+  const effectiveClient = clientOverride?.clientName || cfg.clientName;
+  console.log(`[InnerTube] apiRequest endpoint=${endpoint} client=${effectiveClient} cookieLen=${cookieString ? cookieString.length : 0} perUserCookies=${!!(userId && userCookiesMap.has(userId))} includeAuth=${!!includeAuth}`);
   try {
     const res = await axios.post(url, body, {
-      headers: buildHeaders(cookieString, userId, includeAuth),
+      headers: buildHeaders(cookieString, userId, includeAuth, clientOverride),
       timeout: 10000,
       responseType: "json",
       transitional: { clarifyTimeoutError: true },
@@ -401,7 +405,7 @@ function cleanThumbnail(thumbnails) {
 async function searchQuery(query, type = "song", userId) {
   if (!query) return [];
   try {
-    const data = await apiRequest("search", { query, params: getSearchParams(type) }, {}, userId);
+    const data = await apiRequest("search", { query, params: getSearchParams(type) }, {}, userId, false, "WEB_REMIX");
     const items = parseSearchResults(data, type);
     return items;
   } catch (err) {
@@ -422,33 +426,88 @@ function getSearchParams(type) {
 }
 
 function parseSearchResults(data, type) {
-  if (!data?.contents?.tabbedSearchResultsRenderer?.tabs) return [];
-  const tabs = data.contents.tabbedSearchResultsRenderer.tabs;
-  for (const tab of tabs) {
-    const content = tab?.tabRenderer?.content;
-    if (!content) continue;
-    const sections = content?.sectionListRenderer?.contents || [];
-    const results = [];
-    for (const section of sections) {
-      const items = section?.musicShelfRenderer?.contents || [];
-      for (const item of items) {
-        const musicResponsiveListItemRenderer = item?.musicResponsiveListItemRenderer;
-        if (!musicResponsiveListItemRenderer) continue;
-        const parsed = parseMusicItem(musicResponsiveListItemRenderer);
-        if (parsed) results.push(parsed);
+  const tabbedTabs = data?.contents?.tabbedSearchResultsRenderer?.tabs;
+  if (tabbedTabs) {
+    for (const tab of tabbedTabs) {
+      const content = tab?.tabRenderer?.content;
+      if (!content) continue;
+      const sections = content?.sectionListRenderer?.contents || [];
+      const results = [];
+      for (const section of sections) {
+        const items = section?.musicShelfRenderer?.contents || [];
+        for (const item of items) {
+          const musicResponsiveListItemRenderer = item?.musicResponsiveListItemRenderer;
+          if (!musicResponsiveListItemRenderer) continue;
+          const parsed = parseMusicItem(musicResponsiveListItemRenderer);
+          if (parsed) results.push(parsed);
+        }
       }
+      if (results.length) return results;
     }
-    if (results.length) return results;
   }
-  return [];
+
+  const sections = data?.contents?.sectionListRenderer?.contents || [];
+  const fallbackResults = [];
+  for (const section of sections) {
+    const items = section?.itemSectionRenderer?.contents || section?.musicShelfRenderer?.contents || [];
+    for (const item of items) {
+      const parsed = parseSearchItem(item, type);
+      if (parsed) fallbackResults.push(parsed);
+    }
+  }
+  return fallbackResults;
+}
+
+function parseSearchItem(item, type) {
+  if (item?.musicResponsiveListItemRenderer) {
+    return parseMusicItem(item.musicResponsiveListItemRenderer);
+  }
+  if (item?.compactVideoRenderer && (type === "song" || type === "video")) {
+    return parseCompactVideoItem(item.compactVideoRenderer);
+  }
+  return null;
+}
+
+function parseCompactVideoItem(renderer) {
+  const videoId = renderer?.videoId || renderer?.navigationEndpoint?.watchEndpoint?.videoId || null;
+  const title = renderer?.title?.runs?.map((run) => run?.text || "").join("").trim() || "";
+  if (!videoId || !title) return null;
+
+  const authorRuns = renderer?.shortBylineText?.runs || renderer?.longBylineText?.runs || [];
+  const authors = authorRuns
+    .map((run) => (run?.text || "").trim())
+    .filter(Boolean)
+    .filter((text) => text !== "•");
+  const artistBrowseId = authorRuns.find((run) => run?.navigationEndpoint?.browseEndpoint?.browseId)
+    ?.navigationEndpoint?.browseEndpoint?.browseId || null;
+  const duration = parseDurationMs(renderer?.lengthText?.runs?.map((run) => run?.text || "").join("").trim() || "");
+
+  return {
+    videoId,
+    title,
+    artist: authors[0] || "",
+    authors,
+    album: null,
+    albumBrowseId: null,
+    artistBrowseId,
+    duration,
+    artworkUrl: cleanThumbnail(renderer?.thumbnail?.thumbnails || []),
+    thumbnail: cleanThumbnail(renderer?.thumbnail?.thumbnails || []),
+    uri: `https://www.youtube.com/watch?v=${videoId}`,
+    source: "youtube",
+    isrc: null,
+    explicit: false,
+  };
 }
 
 function parseMusicItem(renderer) {
   const flexColumns = renderer?.flexColumns || [];
   const fixedColumns = renderer?.fixedColumns || [];
-  const getText = (col) => col?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.map(r => r.text).join("") || "";
+  const getRuns = (col) => col?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+  const getText = (col) => getRuns(col).map(r => r.text).join("") || "";
   const title = getText(flexColumns[0]);
   const subtitle = getText(flexColumns[1]);
+  const subtitleRuns = getRuns(flexColumns[1]);
   const thumbnail = renderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails;
   const explicit = hasExplicitBadge(renderer);
   const videoId = renderer?.playlistItemData?.videoId ||
@@ -458,14 +517,16 @@ function parseMusicItem(renderer) {
                   renderer?.navigationEndpoint?.watchPlaylistEndpoint?.playlistId ||
                   null;
   if (!videoId || !title) return null;
-  const authors = subtitle ? subtitle.split("•")[0]?.split(",").map(a => a.trim()).filter(Boolean) : [];
+  const metadata = parseSubtitleRuns(subtitleRuns, subtitle);
   return {
     videoId,
     title,
-    artist: authors[0] || "",
-    authors,
-    album: subtitle?.includes("•") ? subtitle.split("•").slice(1).join("•").trim() : null,
-    duration: null,
+    artist: metadata.authors[0] || "",
+    authors: metadata.authors,
+    album: metadata.album,
+    albumBrowseId: metadata.albumBrowseId,
+    artistBrowseId: metadata.artistBrowseId,
+    duration: metadata.duration,
     artworkUrl: cleanThumbnail(thumbnail),
     thumbnail: cleanThumbnail(thumbnail),
     uri: `https://www.youtube.com/watch?v=${videoId}`,
@@ -473,6 +534,62 @@ function parseMusicItem(renderer) {
     isrc: null,
     explicit,
   };
+}
+
+function parseSubtitleRuns(subtitleRuns, subtitleText) {
+  const runs = Array.isArray(subtitleRuns) ? subtitleRuns : [];
+  const authors = [];
+  let album = null;
+  let albumBrowseId = null;
+  let artistBrowseId = null;
+  let duration = null;
+
+  for (const run of runs) {
+    const text = (run?.text || "").trim();
+    if (!text || text === "•") continue;
+
+    const browseEndpoint = run?.navigationEndpoint?.browseEndpoint;
+    const pageType = browseEndpoint?.browseEndpointContextSupportedConfigs?.browseEndpointContextMusicConfig?.pageType;
+
+    if (pageType === "MUSIC_PAGE_TYPE_ARTIST") {
+      authors.push(text);
+      if (!artistBrowseId) artistBrowseId = browseEndpoint?.browseId || null;
+      continue;
+    }
+
+    if (pageType === "MUSIC_PAGE_TYPE_ALBUM") {
+      if (!album) album = text;
+      if (!albumBrowseId) albumBrowseId = browseEndpoint?.browseId || null;
+      continue;
+    }
+
+    const parsedDuration = parseDurationMs(text);
+    if (parsedDuration != null) {
+      duration = parsedDuration;
+    }
+  }
+
+  if (!authors.length && subtitleText) {
+    const parts = subtitleText.split("•").map((part) => part.trim()).filter(Boolean);
+    if (parts.length) authors.push(...parts[0].split(",").map((part) => part.trim()).filter(Boolean));
+    if (!album) {
+      album = parts.find((part, index) => index > 0 && parseDurationMs(part) == null) || null;
+    }
+    if (duration == null) {
+      const durationText = parts.find((part) => parseDurationMs(part) != null);
+      duration = durationText ? parseDurationMs(durationText) : null;
+    }
+  }
+
+  return { authors, album, albumBrowseId, artistBrowseId, duration };
+}
+
+function parseDurationMs(text) {
+  const value = String(text || "").trim();
+  if (!/^\d{1,2}:\d{2}(?::\d{2})?$/.test(value)) return null;
+  const parts = value.split(":").map((part) => Number(part));
+  if (parts.some((part) => Number.isNaN(part))) return null;
+  return parts.reduce((total, part) => total * 60 + part, 0) * 1000;
 }
 
 function hasExplicitBadge(renderer) {
@@ -566,6 +683,53 @@ function getContinuationToken(item) {
     item?.continuationEndpoint?.continuationCommand?.token ||
     item?.continuation?.continuation ||
     null;
+}
+
+function findDeep(node, predicate, seen = new Set()) {
+  if (!node || typeof node !== "object") return null;
+  if (seen.has(node)) return null;
+  seen.add(node);
+
+  if (predicate(node)) return node;
+
+  if (Array.isArray(node)) {
+    for (const entry of node) {
+      const found = findDeep(entry, predicate, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  for (const value of Object.values(node)) {
+    const found = findDeep(value, predicate, seen);
+    if (found) return found;
+  }
+  return null;
+}
+
+function parseAlbumDetails(data, albumId) {
+  const header = findDeep(data, (node) => node?.musicDetailHeaderRenderer || node?.musicResponsiveHeaderRenderer || node?.musicVisualHeaderRenderer);
+  const renderer = header?.musicDetailHeaderRenderer || header?.musicResponsiveHeaderRenderer || header?.musicVisualHeaderRenderer || {};
+  const title = renderer?.title?.runs?.map((r) => r.text).join("") || renderer?.title?.simpleText || "";
+  const subtitleRuns = renderer?.subtitle?.runs || renderer?.subtitle?.run || [];
+  const subtitle = Array.isArray(subtitleRuns) ? subtitleRuns.map((r) => r.text).join("") : (renderer?.subtitle?.simpleText || "");
+  const thumbnailRuns = renderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails
+    || renderer?.thumbnail?.thumbnails
+    || renderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails
+    || [];
+  const artists = subtitle ? subtitle.split("•")[0]?.split(",").map((a) => a.trim()).filter(Boolean) : [];
+  const typeText = `${title} ${subtitle}`.toLowerCase();
+  const releaseType = typeText.includes("ep") ? "EP" : (typeText.includes("single") ? "Single" : "Album");
+
+  return {
+    albumId,
+    title,
+    artist: artists[0] || "",
+    artists,
+    releaseType,
+    thumbnail: cleanThumbnail(thumbnailRuns),
+    albumUrl: albumId ? `https://music.youtube.com/browse/${albumId}` : null,
+  };
 }
 
 function collectShelfTracks(node, tracks, continuations) {
@@ -700,26 +864,25 @@ async function getStreamUrl(videoId) {
     return null;
   }
 
-  // 1. Formats with direct URL (legacy)
-  let audioFormats = adaptiveFormats.filter(f =>
+  // 1. Recolectar formatos de audio con URL directa y vía cipher.
+  const directAudioFormats = adaptiveFormats.filter(f =>
     f.mimeType?.startsWith("audio/") && f.url
   );
 
-  // 2. Formats with signatureCipher/cipher (modern YouTube)
-  if (!audioFormats.length) {
-    audioFormats = adaptiveFormats
-      .filter(f => f.mimeType?.startsWith("audio/") && (f.signatureCipher || f.cipher))
-      .map(f => {
-        const resolvedUrl = resolveCipher(f);
-        return resolvedUrl ? { ...f, url: resolvedUrl } : null;
-      })
-      .filter(Boolean);
-    if (audioFormats.length) {
-      console.log(`[InnerTube] getStreamUrl(${videoId}): resolved ${audioFormats.length} format(s) via cipher`);
-    }
+  const cipherAudioFormats = adaptiveFormats
+    .filter(f => f.mimeType?.startsWith("audio/") && (f.signatureCipher || f.cipher))
+    .map(f => {
+      const resolvedUrl = resolveCipher(f);
+      return resolvedUrl ? { ...f, url: resolvedUrl } : null;
+    })
+    .filter(Boolean);
+
+  let audioFormats = [...directAudioFormats, ...cipherAudioFormats];
+  if (cipherAudioFormats.length) {
+    console.log(`[InnerTube] getStreamUrl(${videoId}): resolved ${cipherAudioFormats.length} format(s) via cipher`);
   }
 
-  // 3. Try any format with URL regardless of audio/video
+  // 2. Try any format with URL regardless of audio/video
   if (!audioFormats.length) {
     audioFormats = adaptiveFormats.filter(f => f.url);
     if (audioFormats.length) {
@@ -731,8 +894,17 @@ async function getStreamUrl(videoId) {
     console.warn(`[InnerTube] getStreamUrl(${videoId}): no usable formats found (checked url + cipher)`);
     return null;
   }
-  audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  const formatScore = (f) => {
+    const mime = (f.mimeType || '').toLowerCase();
+    const codec = (f.codecs || f.mimeType || '').toLowerCase();
+    const isM4a = mime.includes('audio/mp4') || mime.includes('audio/m4a') || codec.includes('mp4a');
+    const isWebm = mime.includes('audio/webm') || codec.includes('opus') || codec.includes('webm');
+    return (isM4a ? 2_000_000 : 0) + (isWebm ? 0 : 100_000) + (f.bitrate || 0);
+  };
+
+  audioFormats.sort((a, b) => formatScore(b) - formatScore(a));
   const best = audioFormats[0];
+  console.log(`[InnerTube] getStreamUrl(${videoId}): selected mime=${best.mimeType || 'unknown'} bitrate=${best.bitrate || 0}`);
   return best.url;
 }
 
@@ -1022,6 +1194,20 @@ async function getAlbumTracks(albumId, userId) {
   }
 }
 
+async function getAlbumDetails(albumId, userId) {
+  try {
+    const data = await apiRequestWithBrowseFallback({ browseId: albumId }, {}, userId);
+    if (!data) return null;
+    return {
+      ...parseAlbumDetails(data, albumId),
+      tracks: await getAlbumTracks(albumId, userId),
+    };
+  } catch (err) {
+    console.warn(`[InnerTube] getAlbumDetails failed for ${albumId}: ${err.message}`);
+    return null;
+  }
+}
+
 module.exports = {
   searchQuery,
   searchTrack,
@@ -1040,6 +1226,7 @@ module.exports = {
   clearHomeFeedCache,
   getLibraryPlaylists,
   getAlbumTracks,
+  getAlbumDetails,
   resolveCookieString,
   extractDataSyncId,
   resolveDataSyncId,

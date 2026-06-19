@@ -31,6 +31,16 @@ function scoreImageQuality(url) {
   return 0;
 }
 
+function normalizeMatch(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function pickBestArtwork(candidates) {
   return candidates.sort((a, b) => scoreImageQuality(b.url || b) - scoreImageQuality(a.url || a))[0] || null;
 }
@@ -110,8 +120,20 @@ function mergeMetadata(sources) {
       merged.albumName = src.album;
     }
 
+    if (src.albumBrowseId && !merged.albumBrowseId) {
+      merged.albumBrowseId = src.albumBrowseId;
+    }
+
+    if (src.albumUrl && !merged.albumUrl) {
+      merged.albumUrl = src.albumUrl;
+    }
+
     if (src.ytVideoId && !merged.ytVideoId) {
       merged.ytVideoId = src.ytVideoId;
+    }
+
+    if (src.albumType && !merged.albumType) {
+      merged.albumType = src.albumType;
     }
 
     if (src.explicit === true) {
@@ -125,7 +147,8 @@ function mergeMetadata(sources) {
     }
 
     if (src.artworkUrl) {
-      const imgScore = scoreImageQuality(src.artworkUrl);
+      const sourceBoost = src.source === "ytmusic_album" ? 20 : (src.source === "ytmusic" ? 10 : 0);
+      const imgScore = scoreImageQuality(src.artworkUrl) + sourceBoost;
       if (imgScore > bestImageScore) {
         merged.artworkUrl = src.artworkUrl;
         bestImageScore = imgScore;
@@ -140,14 +163,17 @@ function mergeMetadata(sources) {
   return merged;
 }
 
-async function enrichSingleTrack(artist, title, isrc) {
+async function enrichSingleTrack(artist, title, isrc, options = {}) {
   const fp = createFingerprint(artist, title);
+  const forceRefresh = options.forceRefresh === true;
 
   let existing = null;
-  if (isrc) existing = await getMetadataPoolByISRC(isrc);
-  if (!existing) existing = await getMetadataPool(fp);
+  if (!forceRefresh) {
+    if (isrc) existing = await getMetadataPoolByISRC(isrc);
+    if (!existing) existing = await getMetadataPool(fp);
+  }
 
-  if (existing && existing.confidence >= 6) {
+  if (existing && existing.confidence >= 6 && existing.albumName && existing.albumArtworkUrl) {
     return existing;
   }
 
@@ -182,11 +208,32 @@ async function enrichSingleTrack(artist, title, isrc) {
       trackTitle: cleanTitle(yt.title),
       trackAuthor: yt.artist,
       album: yt.album || null,
+      albumType: yt.releaseType || null,
       artworkUrl: yt.thumbnail,
       ytVideoId: yt.videoId,
       duration: yt.duration,
       featuredArtists: yt.authors && yt.authors.length > 1 ? yt.authors.slice(1) : [],
+      albumBrowseId: yt.albumBrowseId || null,
+      albumUrl: yt.albumUrl || null,
     });
+
+    if (yt.albumBrowseId) {
+      try {
+        const albumDetails = await ytmusic.getAlbumDetails(yt.albumBrowseId);
+        if (albumDetails) {
+          sources.push({
+            source: "ytmusic_album",
+            album: albumDetails.title || yt.album || null,
+            trackAuthor: albumDetails.artist || yt.artist,
+            albumType: albumDetails.releaseType || null,
+            artworkUrl: albumDetails.thumbnail,
+            albumUrl: albumDetails.albumUrl,
+            albumBrowseId: albumDetails.albumId || yt.albumBrowseId,
+            featuredArtists: albumDetails.artists && albumDetails.artists.length > 1 ? albumDetails.artists.slice(1) : [],
+          });
+        }
+      } catch (e) {}
+    }
   }
 
   let isrcToUse = isrc || (lavalinkTracks[0]?.isrc) || null;
@@ -200,6 +247,7 @@ async function enrichSingleTrack(artist, title, isrc) {
           trackTitle: d.title,
           trackAuthor: d.artist,
           album: d.album,
+          albumType: d.albumType || null,
           artworkUrl: d.thumbnail,
           explicit: d.explicit,
           genres: d.genres,
@@ -215,6 +263,7 @@ async function enrichSingleTrack(artist, title, isrc) {
       trackTitle: existing.trackTitle,
       trackAuthor: existing.trackAuthor,
       album: existing.albumName,
+      albumType: existing.releaseType || null,
       artworkUrl: existing.artworkUrl,
       ytVideoId: existing.ytVideoId,
       explicit: existing.explicit,
@@ -225,14 +274,36 @@ async function enrichSingleTrack(artist, title, isrc) {
 
   const merged = mergeMetadata(sources);
 
+  let albumArtworkUrl = null;
+  if (merged.albumName) {
+    try {
+      const albumResults = await deezer.searchAlbums(`${artist} ${merged.albumName}`, 5);
+      const wantedArtist = normalizeMatch(artist);
+      const wantedAlbum = normalizeMatch(merged.albumName);
+      const albumMatch = albumResults.find((album) => {
+        const albumName = normalizeMatch(album.name);
+        const albumArtists = normalizeMatch(album.artists);
+        return albumName === wantedAlbum && (!wantedArtist || albumArtists.includes(wantedArtist));
+      }) || albumResults[0] || null;
+
+      albumArtworkUrl = albumMatch?.image || null;
+    } catch (e) {
+      albumArtworkUrl = null;
+    }
+  }
+
   const entry = {
     fingerprint: fp,
     isrc: isrcToUse,
     trackTitle: merged.trackTitle || cleanTitle(title),
     trackAuthor: merged.trackAuthor || artist,
     albumName: merged.albumName || null,
-    artworkUrl: merged.artworkUrl || null,
-    thumbnailUrl: merged.artworkUrl || null,
+    albumType: merged.albumType || null,
+    albumBrowseId: merged.albumBrowseId || null,
+    albumUrl: merged.albumUrl || null,
+    artworkUrl: albumArtworkUrl || merged.artworkUrl || null,
+    thumbnailUrl: albumArtworkUrl || merged.artworkUrl || null,
+    albumArtworkUrl,
     ytVideoId: merged.ytVideoId || null,
     explicit: merged.explicit || false,
     genres: merged.genres || [],
@@ -253,7 +324,7 @@ async function enrichTracks(tracks) {
       const title = t.title || t.track_title || "";
       const isrc = t.isrc || t.pluginInfo?.isrc || null;
       if (!title && !isrc) return { ...t, _enriched: false };
-      const enriched = await enrichSingleTrack(artist, title, isrc);
+      const enriched = await enrichSingleTrack(artist, title, isrc, { forceRefresh: t.forceRefresh === true });
       return {
         ...t,
         title: enriched.trackTitle || t.title,

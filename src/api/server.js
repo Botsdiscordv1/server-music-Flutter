@@ -23,6 +23,8 @@ const homeAggregatorService = require("../services/homeAggregatorService");
 const radioService = require("../services/radioService");
 const eventCollectorService = require("../services/eventCollectorService");
 const rulePerformanceStore = require("../services/rulePerformanceStore");
+const canvasCatalogService = require("../services/canvasCatalogService");
+const { emitUserEvent } = require("../services/realtime");
 
 const axios = require("axios");
 const play = require("play-dl");
@@ -30,6 +32,53 @@ const play = require("play-dl");
 const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
+
+function logCanvas(message) {
+  console.log(`[Canvas] ${message}`);
+}
+
+function emitLibraryChanged(userId, source, reason, extra = {}) {
+  emitUserEvent(userId, "library:changed", {
+    userId: String(userId),
+    source,
+    reason,
+    ...extra,
+  });
+}
+
+function normalizeEmail(email) {
+  return typeof email === "string" ? email.trim().toLowerCase() : null;
+}
+
+function normalizeArtistLookupValue(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s*-\s*topic$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function resolveCanonicalArtistId(artistId, artistName, userId) {
+  if (!artistName) return artistId;
+
+  const results = await innertube.searchQuery(artistName, "artist", userId).catch(() => []);
+  if (!results.length) return artistId;
+
+  const target = normalizeArtistLookupValue(artistName);
+  const exactMatch = results.find((item) => {
+    const title = normalizeArtistLookupValue(item?.title);
+    const artist = normalizeArtistLookupValue(item?.artist);
+    return title === target || artist === target;
+  });
+
+  const closeMatch = results.find((item) => {
+    const title = normalizeArtistLookupValue(item?.title);
+    return title && (title.includes(target) || target.includes(title));
+  });
+
+  const match = exactMatch || closeMatch || results[0];
+  return match?.browseId || match?.videoId || artistId;
+}
 
 play.setToken({ soundcloud: { client_id: "Yks9HNwSpw5Bo7goMq3jv8cyDYgoLpZr" } });
 console.log("[SERVER] SoundCloud initialized");
@@ -86,7 +135,7 @@ function ytDlpGetUrl(videoUrl, isVideo = false) {
   return new Promise((resolve, reject) => {
     const format = isVideo 
       ? "best[ext=mp4]/best" 
-      : "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best";
+      : "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best";
     const args = [
       videoUrl,
       "-f", format,
@@ -559,12 +608,19 @@ app.get("/api/search", requireApiKey, async (req, res) => {
       let tracks = [];
       if (source === "ytmsearch") {
         tracks = await innertube.searchQuery(q);
+        if (tracks.length) {
+          console.log(`[search] InnerTube success source=${source} q="${q}" count=${tracks.length}`);
+        } else {
+          console.log(`[search] InnerTube empty source=${source} q="${q}"`);
+        }
       }
       // Fallback a Lavalink (catch silencioso si está caído)
       if (!tracks.length) {
         try {
           tracks = await searchLavalink(source, q);
+          console.log(`[search] Lavalink ${tracks.length ? "success" : "empty"} source=${source} q="${q}" count=${tracks.length}`);
         } catch (e) {
+          console.warn(`[search] Lavalink failed source=${source} q="${q}": ${e.message}`);
           tracks = [];
         }
       }
@@ -792,8 +848,13 @@ app.get("/api/search/video", requireApiKey, async (req, res) => {
           };
         });
       } else {
-        // Fallback Lavalink si InnerTube no devolvió nada
-        const raw = await searchLavalink("ytsearch", q);
+        // Fallback Lavalink si InnerTube no devolvió nada; si está caído, responder vacío.
+        let raw = [];
+        try {
+          raw = await searchLavalink("ytsearch", q);
+        } catch (e) {
+          raw = [];
+        }
         tracks = raw.map((t) => {
           let artworkUrl = t.artworkUrl || "";
           if (artworkUrl.includes("ytimg.com")) {
@@ -841,7 +902,8 @@ app.get("/api/spotify/search/albums", requireApiKey, async (req, res) => {
     const albums = await spotify.searchAlbums(q, limit);
     res.json({ query: q, albums, source: "spotify" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.warn(`[spotify/search/albums] Fallback empty for query="${req.query.q || ""}": ${err.message}`);
+    res.json({ query: req.query.q || "", albums: [], source: "spotify", degraded: true });
   }
 });
 
@@ -853,7 +915,8 @@ app.get("/api/spotify/search/artists", requireApiKey, async (req, res) => {
     const artists = await spotify.searchArtistsDirect(q, limit);
     res.json({ query: q, artists, source: "spotify" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.warn(`[spotify/search/artists] Fallback empty for query="${req.query.q || ""}": ${err.message}`);
+    res.json({ query: req.query.q || "", artists: [], source: "spotify", degraded: true });
   }
 });
 
@@ -1036,6 +1099,210 @@ app.get("/api/lyrics", requireApiKey, async (req, res) => {
   }
 });
 
+app.get("/api/canvas/manifest", requireApiKey, async (req, res) => {
+  try {
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas("Canvas metadata sent: manifest");
+    res.json(canvasCatalogService.getCatalogSummary(baseUrl));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/canvas/export", requireApiKey, async (req, res) => {
+  try {
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    const snapshot = {
+      exportedAt: new Date().toISOString(),
+      root: canvasCatalogService.CANVAS_LIBRARY_ROOT,
+      ...canvasCatalogService.getCatalogSummary(baseUrl),
+    };
+    logCanvas("Canvas metadata sent: export snapshot");
+    res.json(snapshot);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/canvas/resolve", requireApiKey, async (req, res) => {
+  try {
+    const resolved = canvasCatalogService.resolveRecord(req.query);
+    if (!resolved) return res.status(404).json({ found: false });
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas metadata sent: resolve -> ${resolved.canonicalId}`);
+    res.json({ found: true, item: canvasCatalogService.attachUrls(resolved, baseUrl) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/canvas/register", requireApiKey, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const record = canvasCatalogService.upsertRecord(body);
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas metadata sent: register -> ${record.canonicalId}`);
+    res.json({ found: true, item: canvasCatalogService.attachUrls(record, baseUrl) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/canvas/request", requireApiKey, async (req, res) => {
+  try {
+    const body = req.body || {};
+    canvasCatalogService.syncFilesystemCatalog();
+
+    const refresh = body.refresh === true;
+    const existing = !refresh ? canvasCatalogService.resolveRecord(body) : null;
+    if (existing) {
+      const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+      logCanvas(`Canvas metadata sent: request existing -> ${existing.canonicalId}`);
+      return res.json({
+        found: true,
+        item: canvasCatalogService.attachUrls(existing, baseUrl),
+        queued: false,
+      });
+    }
+
+    const hasCanvasUrl = typeof body.canvasUrl === "string" && body.canvasUrl.trim().length > 0;
+    const record = hasCanvasUrl
+      ? await canvasCatalogService.requestRecord({ ...body, refresh })
+      : canvasCatalogService.createPendingRecord(body);
+
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas metadata sent: request -> ${record.canonicalId}`);
+    res.json({
+      found: true,
+      item: canvasCatalogService.attachUrls(record, baseUrl),
+      folderPath: record.assetPaths?.canvas ? path.dirname(record.assetPaths.canvas) : null,
+      queued: !hasCanvasUrl,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/canvas/ensure-folder", requireApiKey, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const record = await canvasCatalogService.ensureFolderRecord(body);
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas metadata sent: ensure-folder -> ${record.canonicalId}`);
+    res.json({
+      found: true,
+      item: canvasCatalogService.attachUrls(record, baseUrl),
+      folderPath: record.assetPaths?.canvas ? path.dirname(record.assetPaths.canvas) : null,
+      queued: true,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/canvas/sync", requireApiKey, async (req, res) => {
+  try {
+    const synced = canvasCatalogService.syncFilesystemCatalog();
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas metadata sent: sync -> ${synced.length} item(s)`);
+    res.json({
+      ok: true,
+      count: synced.length,
+      items: synced.map((item) => canvasCatalogService.attachUrls(item, baseUrl)),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/canvas/regenerate", requireApiKey, async (req, res) => {
+  try {
+    const refreshed = await canvasCatalogService.regenerateCatalogMetadata();
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas metadata sent: regenerate -> ${refreshed.length} item(s)`);
+    res.json({
+      ok: true,
+      count: refreshed.length,
+      items: refreshed.map((item) => canvasCatalogService.attachUrls(item, baseUrl)),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/canvas/regenerate-item", requireApiKey, async (req, res) => {
+  try {
+    const { canonicalId } = req.body || {};
+    if (!canonicalId) return res.status(400).json({ error: "canonicalId required" });
+
+    const record = await canvasCatalogService.regenerateRecordByCanonicalId(canonicalId);
+    if (!record) return res.status(404).json({ error: "Canvas item not found" });
+
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas metadata sent: regenerate-item -> ${record.canonicalId}`);
+    res.json({
+      found: true,
+      ok: true,
+      item: canvasCatalogService.attachUrls(record, baseUrl),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/canvas/:canonicalId", requireApiKey, async (req, res) => {
+  try {
+    const item = canvasCatalogService.findRecordByCanonicalId(req.params.canonicalId);
+    if (!item) return res.status(404).json({ found: false });
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas metadata sent: item -> ${item.canonicalId}`);
+    res.json({ found: true, item: canvasCatalogService.attachUrls(item, baseUrl) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/canvas/:canonicalId/file/:asset", requireApiKey, async (req, res) => {
+  try {
+    const item = canvasCatalogService.findRecordByCanonicalId(req.params.canonicalId);
+    if (!item) {
+      return res.status(404).json({ error: "Canvas asset not found" });
+    }
+
+    const assetPath = canvasCatalogService.resolveAssetPath(req.params.canonicalId, req.params.asset);
+    if (assetPath && fs.existsSync(assetPath)) {
+      if (req.params.asset === "meta") {
+        logCanvas(`Canvas metadata sent: meta file -> ${item.canonicalId}`);
+        return res.json(canvasCatalogService.readRecordMeta(req.params.canonicalId));
+      }
+
+      if (req.params.asset === "canvas") {
+        const directPath = path.join(canvasCatalogService.recordDir(item.canonicalId), item.file || "canvas.mp4");
+        if (path.resolve(assetPath) !== path.resolve(directPath)) {
+          logCanvas(`Canvas fallback release used: ${item.canonicalId} -> ${assetPath}`);
+        }
+        logCanvas(`Canvas video served: ${item.canonicalId}`);
+      }
+
+      return res.sendFile(assetPath);
+    }
+
+    if (req.params.asset === "canvas" && item.canvasUrl) {
+      logCanvas(`Canvas video served (redirect): ${item.canonicalId}`);
+      return res.redirect(302, item.canvasUrl);
+    }
+
+    if ((req.params.asset === "thumbnail" || req.params.asset === "thumb") && item.thumbnailUrl) {
+      logCanvas(`Canvas metadata sent: thumbnail redirect -> ${item.canonicalId}`);
+      return res.redirect(302, item.thumbnailUrl);
+    }
+
+    return res.status(404).json({ error: "Canvas asset not found" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/likes/:userId", requireApiKey, async (req, res) => {
   try {
     const userId = req.userId || req.params.userId;
@@ -1123,6 +1390,8 @@ app.post("/api/likes/:userId", requireApiKey, async (req, res) => {
     const added = await db.addLikedSong(userId, mockTrack, connSource);
     res.json({ added });
 
+    emitLibraryChanged(userId, connSource, "like-added", { trackUrl });
+
     // Clear home cache for instant updates
     homeAggregatorService.clearUserCache(userId, connSource);
 
@@ -1132,6 +1401,7 @@ app.post("/api/likes/:userId", requireApiKey, async (req, res) => {
         const enriched = await metadataEnricher.enrichSingleTrack(trackAuthor, trackTitle, isrc);
         if (enriched && enriched.confidence >= 3) {
           await db.updateLikedSongMetadata(userId, trackUrl, enriched, connSource);
+          emitLibraryChanged(userId, connSource, "like-enriched", { trackUrl });
           console.log(`[MetadataPool] Auto-enriched liked track: ${trackTitle} - ${trackAuthor}`);
         }
       } catch (e) {
@@ -1174,6 +1444,8 @@ app.delete("/api/likes/:userId", requireApiKey, async (req, res) => {
     const removed = await db.removeLikedSongByTrack(userId, mockTrack, source);
     res.json({ removed });
 
+    emitLibraryChanged(userId, source, "like-removed", { trackUrl });
+
     // Clear home cache for instant updates
     homeAggregatorService.clearUserCache(userId, source);
   } catch (err) {
@@ -1203,6 +1475,8 @@ app.post("/api/albums/like", requireApiKey, async (req, res) => {
     if (!albumId) return res.status(400).json({ error: "albumId is required" });
     const result = await db.toggleLikeAlbum(userId, { albumId, albumName, artistName, artworkUrl, albumUrl }, source);
     res.json(result);
+
+    emitLibraryChanged(userId, source, "album-liked", { albumId, liked: !!result?.liked });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1229,7 +1503,18 @@ app.get("/api/artists/followed", requireApiKey, async (req, res) => {
     const source = req.provider || "android";
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
     const artists = await db.getFollowedArtists(userId, source);
-    res.json({ artists });
+    const normalizedArtists = await Promise.all(artists.map(async (artist) => {
+      const canonicalArtistId = await resolveCanonicalArtistId(artist.artistId, artist.artistName, userId);
+      if (canonicalArtistId && canonicalArtistId !== artist.artistId) {
+        await db.setFollowedArtistCanonicalId(userId, artist.artistId, canonicalArtistId, source).catch(() => null);
+      }
+      return {
+        ...artist,
+        id: canonicalArtistId || artist.artistId,
+        artistId: canonicalArtistId || artist.artistId,
+      };
+    }));
+    res.json({ artists: normalizedArtists });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1242,8 +1527,11 @@ app.post("/api/artists/follow", requireApiKey, async (req, res) => {
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
     const { artistId, artistName, imageUrl } = req.body;
     if (!artistId) return res.status(400).json({ error: "artistId is required" });
-    const result = await db.toggleFollowArtist(userId, { artistId, artistName, imageUrl }, source);
-    res.json(result);
+    const canonicalArtistId = await resolveCanonicalArtistId(artistId, artistName, userId);
+    const result = await db.toggleFollowArtist(userId, { artistId: canonicalArtistId || artistId, artistName, imageUrl }, source);
+    res.json({ ...result, artistId: canonicalArtistId || artistId });
+
+    emitLibraryChanged(userId, source, "artist-followed", { artistId: canonicalArtistId || artistId, followed: !!result?.followed });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1254,10 +1542,11 @@ app.get("/api/artists/followed/check", requireApiKey, async (req, res) => {
     const userId = req.userId;
     const source = req.provider || "android";
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
-    const { artistId } = req.query;
+    const { artistId, artistName } = req.query;
     if (!artistId) return res.status(400).json({ error: "artistId query param is required" });
-    const followed = await db.isArtistFollowed(userId, artistId, source);
-    res.json({ followed });
+    const canonicalArtistId = await resolveCanonicalArtistId(artistId, artistName, userId);
+    const followed = await db.isArtistFollowed(userId, canonicalArtistId || artistId, source);
+    res.json({ followed, artistId: canonicalArtistId || artistId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1579,6 +1868,9 @@ app.post("/api/admin/enrich-all-likes", requireApiKey, async (req, res) => {
           console.warn(`[Metadata/Admin] Failed: ${song.track_title} - ${e.message}`);
         }
       }
+      if (enriched > 0) {
+        emitLibraryChanged(userId, connSource, "library-enriched", { enriched });
+      }
       console.log(`[Metadata/Admin] Enriched ${enriched}/${allLikes.length} liked songs for user ${userId}`);
     });
   } catch (err) {
@@ -1801,6 +2093,11 @@ app.post("/api/sync", requireAuth, async (req, res) => {
     }
 
     res.json(result);
+
+    emitLibraryChanged(userId, source, "sync-updated", {
+      synced: true,
+      sections: Object.keys(req.body || {}),
+    });
   } catch (err) {
     console.error("Sync Error:", err.stack);
     res.status(500).json({ error: err.message });
@@ -1819,6 +2116,63 @@ function signToken(user, provider = "android") {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES });
 }
 
+function resolveGoogleRedirect(req) {
+  const fallback = process.env.CLIENT_URL || "auris://auth";
+  const state = req.query?.state;
+  if (!state) return fallback;
+
+  try {
+    const decoded = decodeURIComponent(state);
+    const uri = new URL(decoded);
+    const isLoopback = uri.hostname === "127.0.0.1" || uri.hostname === "localhost";
+    if ((uri.protocol === "http:" || uri.protocol === "https:") && isLoopback) {
+      return uri.toString().replace(/\/$/, "");
+    }
+  } catch {}
+
+  return fallback;
+}
+
+function getAbsoluteBaseUrl(req) {
+  const envBase = process.env.PUBLIC_BASE_URL || process.env.SERVER_PUBLIC_URL || process.env.CLIENT_URL;
+  if (envBase && /^https?:\/\//i.test(envBase)) {
+    return envBase.replace(/\/+$/, "");
+  }
+
+  const host = req?.get?.("host") || req?.headers?.host;
+  if (host) {
+    const proto = (req?.headers?.["x-forwarded-proto"] || req?.protocol || "http").split(",")[0].trim();
+    return `${proto}://${host}`.replace(/\/+$/, "");
+  }
+
+  return "http://localhost:3000";
+}
+
+function getGoogleCallbackUrl(req) {
+  return process.env.GOOGLE_CALLBACK_URL || `${getAbsoluteBaseUrl(req)}/api/auth/google/callback`;
+}
+
+function googleAuthOptions(req) {
+  return {
+    session: false,
+    scope: ["profile", "email"],
+    callbackURL: getGoogleCallbackUrl(req),
+    state: req.query?.state,
+  };
+}
+
+function sendGoogleAuthResult(req, res, user) {
+  const token = signToken(user);
+  const redirectUri = resolveGoogleRedirect(req);
+
+  const ua = (req.headers["user-agent"] || "").toLowerCase();
+  if (ua.includes("okhttp") || ua.includes("dalvik") || ua.includes("android")) {
+    return res.json({ token, user: user.toPublicJSON() });
+  }
+
+  return res.redirect(`${redirectUri}${redirectUri.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`);
+}
+
 // ── Discord OAuth Strategy ────────────────────────────────────────────
 passport.use(new DiscordStrategy({
   clientID: process.env.DISCORD_CLIENT_ID,
@@ -1831,7 +2185,7 @@ passport.use(new DiscordStrategy({
     let user = await DiscordUser.findOne({ discordId: profile.id });
     if (user) return done(null, user);
 
-    const email = profile.email || null;
+    const email = normalizeEmail(profile.email);
     if (email) {
       user = await DiscordUser.findOne({ email });
       if (user) {
@@ -1862,12 +2216,9 @@ passport.use(new GoogleStrategy({
   scope: ["profile", "email"],
 }, async (accessToken, refreshToken, profile, done) => {
   try {
-    // 1. Buscar por googleId
-    let user = await User.findOne({ googleId: profile.id });
-    if (user) return done(null, user);
-
-    // 2. Si tiene email, buscar si ya existe la cuenta y vincularla
-    const email = profile.emails?.[0]?.value || null;
+    let user;
+    // 1. Priorizar email para unificar cuentas entre providers
+    const email = normalizeEmail(profile.emails?.[0]?.value);
     if (email) {
       user = await User.findOne({ email });
       if (user) {
@@ -1879,6 +2230,10 @@ passport.use(new GoogleStrategy({
         return done(null, user);
       }
     }
+
+    // 2. Si no había email o no existía la cuenta, buscar por googleId
+    user = await User.findOne({ googleId: profile.id });
+    if (user) return done(null, user);
 
     // 3. Crear nuevo usuario
     user = await User.create({
@@ -1900,12 +2255,14 @@ app.post("/api/auth/register", async (req, res) => {
       return res.status(400).json({ error: "username, email, and password are required" });
     }
 
-    const existing = await User.findOne({ email: email.toLowerCase() }).exec();
+    const normalizedEmail = normalizeEmail(email);
+
+    const existing = await User.findOne({ email: normalizedEmail }).exec();
     if (existing) {
       return res.status(409).json({ error: "Email already registered" });
     }
 
-    const user = await User.create({ username, email: email.toLowerCase(), password });
+    const user = await User.create({ username, email: normalizedEmail, password });
     const token = signToken(user);
     res.status(201).json({ token, user: user.toPublicJSON() });
   } catch (err) {
@@ -1920,7 +2277,7 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(400).json({ error: "email and password are required" });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() }).exec();
+    const user = await User.findOne({ email: normalizeEmail(email) }).exec();
     if (!user || !user.password) {
       return res.status(401).json({ error: "Invalid email or password" });
     }
@@ -1974,14 +2331,7 @@ app.get("/api/auth/google/callback", (req, res, next) => {
       console.error("[Google OAuth] Error:", err?.message);
       return res.status(401).json({ error: "auth_failed" });
     }
-    const token = signToken(user);
-    const clientUrl = process.env.CLIENT_URL || "auris://auth";
-
-    const ua = (req.headers["user-agent"] || "").toLowerCase();
-    if (ua.includes("okhttp") || ua.includes("dalvik")) {
-      return res.json({ token, user: user.toPublicJSON() });
-    }
-    res.redirect(`${clientUrl}?token=${encodeURIComponent(token)}`);
+    sendGoogleAuthResult(req, res, user);
   })(req, res, next);
 });
 
@@ -2002,10 +2352,14 @@ app.post("/api/auth/google", async (req, res) => {
       return res.status(401).json({ error: "Invalid Google token" });
     }
 
-    const { sub: googleId, email, name, picture } = payload;
+    const { sub: googleId, email: rawEmail, name, picture } = payload;
+    const email = normalizeEmail(rawEmail);
 
-    // 1. Buscar o vincular usuario
-    let user = await User.findOne({ $or: [{ googleId }, { email }] });
+    // 1. Priorizar email para unir cuentas Google/email-password
+    let user = email ? await User.findOne({ email }) : null;
+    if (!user) {
+      user = await User.findOne({ googleId });
+    }
 
     if (!user) {
       user = await User.create({
@@ -2014,10 +2368,21 @@ app.post("/api/auth/google", async (req, res) => {
         googleId,
         avatar: picture || "",
       });
-    } else if (!user.googleId) {
-      user.googleId = googleId;
-      if (!user.avatar) user.avatar = picture || "";
-      await user.save();
+    } else {
+      let needsSave = false;
+      if (email && !user.email) {
+        user.email = email;
+        needsSave = true;
+      }
+      if (!user.googleId) {
+        user.googleId = googleId;
+        needsSave = true;
+      }
+      if (!user.avatar) {
+        user.avatar = picture || "";
+        needsSave = true;
+      }
+      if (needsSave) await user.save();
     }
 
     // 2. Extraer cookies YTM si el cliente las envía en el body o headers
@@ -2034,25 +2399,17 @@ app.post("/api/auth/google", async (req, res) => {
   }
 });
 
-app.get("/api/auth/google",
-  passport.authenticate("google", { session: false, scope: ["profile", "email"] })
-);
+app.get("/api/auth/google", (req, res, next) => {
+  passport.authenticate("google", googleAuthOptions(req))(req, res, next);
+});
 
 app.get("/api/auth/google/callback", (req, res, next) => {
-  passport.authenticate("google", { session: false }, (err, user) => {
+  passport.authenticate("google", googleAuthOptions(req), (err, user) => {
     if (err || !user) {
       console.error("[Google OAuth] Error:", err?.message);
       return res.status(401).json({ error: "auth_failed" });
     }
-    const token = signToken(user);
-    const clientUrl = process.env.CLIENT_URL || "auris://auth";
-
-    const ua = (req.headers["user-agent"] || "").toLowerCase();
-    if (ua.includes("android") || ua.includes("okhttp") || ua.includes("dalvik")) {
-      return res.json({ token, user: user.toPublicJSON() });
-    }
-
-    res.redirect(`${clientUrl}?token=${encodeURIComponent(token)}`);
+    sendGoogleAuthResult(req, res, user);
   })(req, res, next);
 });
 

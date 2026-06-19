@@ -6,7 +6,10 @@
   "type": "commonjs",
   "scripts": {
     "start": "node --max-old-space-size=300 --expose-gc src/index.js",
-    "dev": "node --watch --expose-gc src/index.js"
+    "dev": "node --watch --expose-gc src/index.js",
+    "canvas:ingest": "node scripts/canvas-ingestor.js",
+    "canvas:export": "node scripts/canvas-export.js",
+    "canvas:watch": "node scripts/canvas-export.js --watch"
   },
   "dependencies": {
     "@distube/yt-dlp": "^2.0.1",
@@ -22,6 +25,7 @@
     "passport-google-oauth20": "^2.0.0",
     "passport-local": "^1.0.0",
     "play-dl": "^1.9.7",
+    "socket.io": "^4.8.3",
     "sql.js": "^1.11.0",
     "youtube-music-api": "^1.0.6"
   },

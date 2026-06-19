@@ -11,3 +11,8 @@ stream-cache.json
 .ytdlp-cache/
 
 Firefox Installer.exe
+
+# Local debug / logs
+scratch/
+server_err.txt
+server_out.txt

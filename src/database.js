@@ -602,12 +602,42 @@ async function toggleFollowArtist(userId, artist, source = "android") {
   return { followed: true };
 }
 
+async function setFollowedArtistCanonicalId(userId, artistId, canonicalArtistId, source = "android") {
+  const { FollowedArtist } = getModels(source);
+  await whenReady(() => {});
+
+  if (!artistId || !canonicalArtistId || artistId === canonicalArtistId) return null;
+
+  const current = await FollowedArtist.findOne({ userId, artistId });
+  if (!current) return null;
+
+  const existingCanonical = await FollowedArtist.findOne({ userId, artistId: canonicalArtistId });
+  if (existingCanonical) {
+    let changed = false;
+    if (!existingCanonical.artistName && current.artistName) {
+      existingCanonical.artistName = current.artistName;
+      changed = true;
+    }
+    if (!existingCanonical.imageUrl && current.imageUrl) {
+      existingCanonical.imageUrl = current.imageUrl;
+      changed = true;
+    }
+    if (changed) await existingCanonical.save();
+    await FollowedArtist.deleteOne({ _id: current._id });
+    return existingCanonical.toObject();
+  }
+
+  current.artistId = canonicalArtistId;
+  await current.save();
+  return current.toObject();
+}
+
 async function getFollowedArtists(userId, source = "android") {
   const { FollowedArtist } = getModels(source);
   await whenReady(() => {});
   const docs = await FollowedArtist.find({ userId }).sort({ followedAt: -1 }).lean();
   return docs.map(doc => ({
-    id: doc._id.toString(),
+    id: doc.artistId,
     artistId: doc.artistId,
     artistName: doc.artistName,
     imageUrl: doc.imageUrl,
@@ -1084,7 +1114,7 @@ async function syncUserData(userId, localData, source = "android") {
     }
     const all = await FollowedArtist.find({ userId }).sort({ followedAt: -1 }).lean();
     result.followedArtists = all.map(a => ({
-      id: a._id.toString(),
+      id: a.artistId,
       artistId: a.artistId,
       artist_name: a.artistName,
       image_url: a.imageUrl,
@@ -1290,6 +1320,7 @@ module.exports = {
   getLikedAlbums,
   isAlbumLiked,
   toggleFollowArtist,
+  setFollowedArtistCanonicalId,
   getFollowedArtists,
   isArtistFollowed,
   incrementTrackPlay,
