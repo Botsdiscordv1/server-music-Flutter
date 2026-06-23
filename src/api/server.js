@@ -3110,6 +3110,8 @@ app.post("/api/auth/google", async (req, res) => {
 
     if (!idToken) return res.status(400).json({ error: "idToken is required" });
 
+    console.log(`[Google Auth] idToken prefix=${idToken.substring(0, 30)}... len=${idToken.length} parts=${idToken.split(".").length}`);
+
     // Verificar token con Google API
     const googleRes = await axios.get(`https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`, {
       timeout: 10000,
