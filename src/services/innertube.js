@@ -314,6 +314,9 @@ function setCookies(cookieString, userId) {
       extractDataSyncId(cookieString).then(dsId => {
         if (dsId) userDataSyncIdMap.set(userId, dsId);
       });
+      scrapeVisitorData(cookieString).then(vd => {
+        if (vd) userVisitorDataMap.set(userId, vd);
+      });
       return true;
     }
     return false;
@@ -326,6 +329,9 @@ function setCookies(cookieString, userId) {
       // Refresh cached auth metadata for the global fallback.
       extractDataSyncId(cookieString).then(dsId => {
         if (dsId) userDataSyncIdMap.set("__global__", dsId);
+      });
+      scrapeVisitorData(cookieString).then(vd => {
+        if (vd) userVisitorDataMap.set("__global__", vd);
       });
       return true;
     }
@@ -393,6 +399,30 @@ async function extractDataSyncId(cookieString) {
     return null;
   } catch (e) {
     console.warn(`[InnerTube] Failed to extract dataSyncId: ${e.message}`);
+    return null;
+  }
+}
+
+async function scrapeVisitorData(cookieString) {
+  if (!cookieString) return null;
+  try {
+    const res = await axios.get(`${YTM_BASE}/`, {
+      headers: { "User-Agent": USER_AGENT, "Cookie": cookieString, "Accept-Language": "en-US" },
+      timeout: 10000,
+    });
+    let ytcfg = {};
+    res.data.split("ytcfg.set(").forEach(v => {
+      try { Object.assign(ytcfg, JSON.parse(v.split(");")[0])); } catch {}
+    });
+    const vd = ytcfg.VISITOR_DATA;
+    if (vd) {
+      console.log(`[InnerTube] visitorData extracted (len=${vd.length})`);
+      return vd;
+    }
+    console.warn("[InnerTube] VISITOR_DATA not found in ytcfg");
+    return null;
+  } catch (e) {
+    console.warn(`[InnerTube] Failed to extract visitorData: ${e.message}`);
     return null;
   }
 }
@@ -574,11 +604,7 @@ function buildHeaders(cookieString, userId, includeAuth, clientOverride) {
       } else {
         console.warn("[InnerTube] SAPISID hash generation failed - no SAPISID/APISID cookie found");
       }
-      // X-Goog-Delegate-To: sesion ID para autenticacion delegada
-      const dataSyncId = resolveDataSyncId(userId);
-      if (dataSyncId) {
-        h["X-Goog-Delegate-To"] = `/g/@${dataSyncId}`;
-      }
+
     }
   }
   return h;
@@ -597,7 +623,7 @@ async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clien
   // IOS_MUSIC como fallback si ANDROID_MUSIC falla en player
   const defaultClient = endpointClientMap[endpoint] || null;
   const clientOverride = clientNameOverride ? resolveClientConfig(clientNameOverride) : (defaultClient ? resolveClientConfig(defaultClient) : null);
-  const url = `${YTM_BASE}/youtubei/${cfg.apiVersion}/${endpoint}?${querystring.stringify({ alt: "json", key: cfg.apiKey || API_KEY, ...query })}`;
+  const url = `${YTM_BASE}/youtubei/${cfg.apiVersion}/${endpoint}?${querystring.stringify({ alt: "json", ...query })}`;
   const body = { ...data, context: buildContext(userId, includeAuth, clientOverride) };
   const cookieString = resolveCookieString(userId);
   const effectiveClient = clientOverride?.clientName || cfg.clientName;
