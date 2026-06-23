@@ -221,7 +221,7 @@ function checkRateLimit(endpoint) {
     lastReset = now;
   }
   requestCounts[endpoint] = (requestCounts[endpoint] || 0) + 1;
-  const limits = { search: 10, player: 3 };
+  const limits = { search: 10, player: 5 };
   if (requestCounts[endpoint] > limits[endpoint]) {
     throw new Error(`Rate limited: ${endpoint} (${limits[endpoint]}/s)`);
   }
@@ -1542,6 +1542,7 @@ async function getPlayer(videoId, options = {}) {
       }
       if (data?.playabilityStatus?.status !== "OK") {
         lastError = new Error(data?.playabilityStatus?.reason || "playability not OK");
+        if (data?.playabilityStatus?.reason === "FAILED_PRECONDITION") break;
         continue;
       }
     } catch (err) {
@@ -1550,6 +1551,8 @@ async function getPlayer(videoId, options = {}) {
       if (err?.response?.status === 400 && err?.response?.data?.error?.message?.includes?.("INVALID_ARGUMENT")) {
         // retry without dataSyncId handled inside apiRequest
       }
+      const msg = err?.response?.data?.error?.message || "";
+      if (msg.includes("FAILED_PRECONDITION")) break;
       continue;
     }
   }
