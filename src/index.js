@@ -9,6 +9,7 @@ const { app: musicApi } = require("./api/server");
 const innertube = require("./services/innertube");
 const canvasCatalogService = require("./services/canvasCatalogService");
 const { setRealtimeServer } = require("./services/realtime");
+const { attachSocket } = require("./services/deviceSessionService");
 
 // Usar el puerto de Render o 3000 por defecto
 const PORT = process.env.PORT || 3000;
@@ -148,6 +149,7 @@ function attachRealtime(serverInstance) {
 
     socket.join(String(userId));
     socket.emit("realtime:ready", { userId: String(userId) });
+    attachSocket(socket);
     console.log(`[Realtime] Connected user=${userId} socket=${socket.id}`);
 
     socket.on("disconnect", (reason) => {

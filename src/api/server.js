@@ -17,17 +17,22 @@ const {
 } = db;
 const { getLyrics } = require("../services/lrclib");
 const spotify = require("../services/spotify");
+const deezer = require("../services/deezer");
 const innertube = require("../services/innertube");
 const metadataEnricher = require("../services/metadataEnricher");
 const homeAggregatorService = require("../services/homeAggregatorService");
+const recommendationService = require("../services/recommendationService");
 const radioService = require("../services/radioService");
 const eventCollectorService = require("../services/eventCollectorService");
 const rulePerformanceStore = require("../services/rulePerformanceStore");
 const canvasCatalogService = require("../services/canvasCatalogService");
 const { emitUserEvent } = require("../services/realtime");
+const { getUserState, transferActiveDevice } = require("../services/deviceSessionService");
+const { isExcluded, scoreTrack: scoreTrackBase } = require("../utils/trackFilter");
 
 const axios = require("axios");
 const play = require("play-dl");
+const crypto = require("crypto");
 
 const { spawn } = require("child_process");
 const path = require("path");
@@ -58,26 +63,210 @@ function normalizeArtistLookupValue(value) {
     .trim();
 }
 
+const SEARCH_STOPWORDS = new Set([
+  "the", "a", "an", "and", "of", "for", "to", "de", "del", "la", "el", "los", "las", "y", "en", "feat", "ft",
+]);
+
+function normalizeSearchText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .replace(/['’`]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeSearchText(value) {
+  return normalizeSearchText(value)
+    .split(" ")
+    .filter((token) => token.length > 1 && !SEARCH_STOPWORDS.has(token));
+}
+
+function extractSearchIntent(query) {
+  const norm = normalizeSearchText(query);
+  let title = norm;
+  let artist = "";
+
+  const byIndex = norm.indexOf(" by ");
+  if (byIndex > 0) {
+    title = norm.slice(0, byIndex).trim();
+    artist = norm.slice(byIndex + 4).trim();
+  } else {
+    const dashMatch = norm.match(/\s[-–—]\s/);
+    if (dashMatch && dashMatch.index > 0) {
+      title = norm.slice(0, dashMatch.index).trim();
+      artist = norm.slice(dashMatch.index + dashMatch[0].length).trim();
+    }
+  }
+
+  return {
+    raw: query || "",
+    norm,
+    title,
+    artist,
+    tokens: tokenizeSearchText(query),
+  };
+}
+
+function countSharedTokens(a, b) {
+  const setB = new Set(b);
+  let count = 0;
+  for (const token of a) {
+    if (setB.has(token)) count++;
+  }
+  return count;
+}
+
+function chooseSeedArtist(query, rankedItems, intent) {
+  if (intent.artist) return intent.artist;
+  if (!Array.isArray(rankedItems) || rankedItems.length === 0) return "";
+
+  const topItems = rankedItems.slice(0, 6).filter((item) => item.score > 0);
+  if (!topItems.length) return "";
+
+  const counts = new Map();
+  for (const item of topItems) {
+    const artist = normalizeSearchText(item.track?.artist || item.track?.author || "");
+    if (!artist) continue;
+    counts.set(artist, (counts.get(artist) || 0) + 1);
+  }
+
+  let winner = "";
+  let bestCount = 0;
+  for (const [artist, count] of counts.entries()) {
+    if (count > bestCount) {
+      winner = artist;
+      bestCount = count;
+    }
+  }
+  return winner;
+}
+
+function scoreSearchResult(track, intent) {
+  const title = normalizeSearchText(track?.title || "");
+  const artist = normalizeSearchText(track?.artist || track?.author || "");
+  const rawTitle = track?.title || "";
+  const rawArtist = track?.artist || track?.author || "";
+
+  if (!title || isExcluded(rawTitle)) return -Infinity;
+
+  let score = scoreTrackBase({ info: { title: rawTitle, author: rawArtist } });
+
+  if (intent.title) {
+    if (title === intent.title) score += 80;
+    else if (title.includes(intent.title) || intent.title.includes(title)) score += 45;
+    else score += Math.min(countSharedTokens(tokenizeSearchText(title), tokenizeSearchText(intent.title)) * 8, 24);
+  }
+
+  if (intent.artist) {
+    if (artist === intent.artist) score += 50;
+    else if (artist.includes(intent.artist) || intent.artist.includes(artist)) score += 25;
+    else score -= 15;
+  }
+
+  const shared = countSharedTokens(tokenizeSearchText(`${rawTitle} ${rawArtist}`), intent.tokens);
+  score += Math.min(shared * 3, 18);
+
+  if (/\b(topic|vevo|official)\b/i.test(rawArtist)) score += 10;
+  if (/\b(lyrics?|visualizer|audio only)\b/i.test(rawTitle)) score -= 14;
+  if (/\b(live|cover|karaoke|sped up|slowed|reverb|demo|edit)\b/i.test(rawTitle)) score -= 18;
+
+  return score;
+}
+
+function rankSearchResults(query, tracks) {
+  if (!Array.isArray(tracks) || tracks.length === 0) return [];
+  const intent = extractSearchIntent(query);
+  const ranked = tracks
+    .map((track, index) => ({ track, score: scoreSearchResult(track, intent), index }))
+    .filter((item) => item.score > -Infinity)
+    .sort((a, b) => (b.score - a.score) || (a.index - b.index));
+
+  if (!ranked.length) return [];
+
+  const seedArtist = chooseSeedArtist(query, ranked, intent);
+  const exact = [];
+  const sameArtist = [];
+  const rest = [];
+
+  for (const item of ranked) {
+    const artist = normalizeSearchText(item.track?.artist || item.track?.author || "");
+    const title = normalizeSearchText(item.track?.title || "");
+    const isExactTitle = intent.title && (title === intent.title);
+    const isExactArtist = intent.artist && (artist === intent.artist);
+    const isSeedArtist = seedArtist && artist === seedArtist;
+
+    if (isExactTitle || isExactArtist || (intent.tokens.length && countSharedTokens(tokenizeSearchText(`${item.track?.title || ""} ${item.track?.artist || item.track?.author || ""}`), intent.tokens) >= Math.max(2, Math.ceil(intent.tokens.length / 2)))) {
+      exact.push(item);
+    } else if (isSeedArtist) {
+      sameArtist.push(item);
+    } else {
+      rest.push(item);
+    }
+  }
+
+  return [...exact, ...sameArtist, ...rest].map((item) => item.track);
+}
+
+function isLikelyBrowseId(value) {
+  if (!value || typeof value !== "string") return false;
+  // YouTube channel IDs: UC..., UU..., PU...
+  if (/^[A-Z]{2}[A-Za-z0-9_-]{20,}$/.test(value)) return true;
+  // YouTube Music browse IDs: MP..., FEmusic_..., etc.
+  if (/^(MP|OL|RD|VL|PL|LL|EC|FEmusic|FE)/.test(value)) return true;
+  // Already a full URL
+  if (value.startsWith("http://") || value.startsWith("https://")) return true;
+  return false;
+}
+
 async function resolveCanonicalArtistId(artistId, artistName, userId) {
+  // Si ya es un browseId v�lido, usarlo directamente sin resolver
+  if (isLikelyBrowseId(artistId)) return artistId;
   if (!artistName) return artistId;
 
   const results = await innertube.searchQuery(artistName, "artist", userId).catch(() => []);
   if (!results.length) return artistId;
 
+  // Buscar el item que sea un artista (tiene browseId y pageType ARTIST)
+  const artistItems = results.filter(item => {
+    const pt = item.pageType || "";
+    return pt === "MUSIC_PAGE_TYPE_ARTIST" || !!item.artistBrowseId || !!item.browseId;
+  });
+
   const target = normalizeArtistLookupValue(artistName);
-  const exactMatch = results.find((item) => {
+
+  // Primero buscar coincidencia exacta entre los items de tipo artista
+  const exactArtistMatch = artistItems.find((item) => {
     const title = normalizeArtistLookupValue(item?.title);
     const artist = normalizeArtistLookupValue(item?.artist);
     return title === target || artist === target;
   });
 
-  const closeMatch = results.find((item) => {
+  if (exactArtistMatch) {
+    return exactArtistMatch.artistBrowseId || exactArtistMatch.browseId || exactArtistMatch.videoId || artistId;
+  }
+
+  // Luego entre todos los resultados
+  const allExactMatch = results.find((item) => {
     const title = normalizeArtistLookupValue(item?.title);
-    return title && (title.includes(target) || target.includes(title));
+    const artist = normalizeArtistLookupValue(item?.artist);
+    return title === target || artist === target;
   });
 
-  const match = exactMatch || closeMatch || results[0];
-  return match?.browseId || match?.videoId || artistId;
+  const closeMatch = artistItems.length > 0
+    ? artistItems.find((item) => {
+        const title = normalizeArtistLookupValue(item?.title);
+        return title && (title.includes(target) || target.includes(title));
+      })
+    : results.find((item) => {
+        const title = normalizeArtistLookupValue(item?.title);
+        return title && (title.includes(target) || target.includes(title));
+      });
+
+  const match = allExactMatch || closeMatch || artistItems[0] || results[0];
+  return match?.artistBrowseId || match?.browseId || match?.videoId || artistId;
 }
 
 play.setToken({ soundcloud: { client_id: "Yks9HNwSpw5Bo7goMq3jv8cyDYgoLpZr" } });
@@ -158,6 +347,225 @@ function ytDlpGetUrl(videoUrl, isVideo = false) {
     });
     proc.on("error", reject);
   });
+}
+
+function ytDlpGetJson(videoUrl, { flatPlaylist = true } = {}) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      videoUrl,
+      "-J",
+      "--no-warnings",
+      "--extractor-retries", "3",
+    ];
+    if (flatPlaylist) args.splice(2, 0, "--flat-playlist");
+    if (hasYtCookies) args.push("--cookies", COOKIES_PATH);
+
+    const proc = spawn(YTDLP_PATH, args, { timeout: 20000 });
+    let stdout = "", stderr = "";
+    proc.stdout.on("data", d => stdout += d);
+    proc.stderr.on("data", d => stderr += d);
+    proc.on("close", code => {
+      const raw = stdout.toString().trim();
+      if (code === 0 && raw) {
+        try {
+          resolve(JSON.parse(raw));
+        } catch (err) {
+          reject(new Error(`Invalid yt-dlp JSON: ${err.message}`));
+        }
+      } else {
+        reject(new Error(stderr || `Exit code ${code}`));
+      }
+    });
+    proc.on("error", reject);
+  });
+}
+
+const albumResponseCache = new Map();
+const ALBUM_RESPONSE_CACHE_TTL = 5 * 60 * 1000;
+const albumResponseInFlight = new Map();
+
+function getAlbumResponseCacheKey(albumId, userId) {
+  return `${getSessionCacheScope(userId)}:${albumId}`;
+}
+
+function getSessionCacheScope(userId) {
+  const cookieString = innertube.resolveCookieString(userId) || "";
+  const cookieHash = cookieString
+    ? crypto.createHash("sha1").update(cookieString).digest("hex").slice(0, 12)
+    : "nocookie";
+  return `${userId || "guest"}:${cookieHash}`;
+}
+
+function clearScopedCaches(userId) {
+  const prefix = `${userId || "guest"}:`;
+  for (const key of albumResponseCache.keys()) {
+    if (key.startsWith(prefix)) albumResponseCache.delete(key);
+  }
+  for (const key of searchCache.keys()) {
+    if (key.startsWith(prefix)) searchCache.delete(key);
+  }
+  artistInfoCache.clear();
+  artistImageCache.clear();
+}
+
+innertube.onSessionChange(({ userId }) => {
+  clearScopedCaches(userId);
+});
+
+function normalizeYtDlpAlbumTracks(payload, albumId) {
+  const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+  return entries
+    .map((entry) => {
+      const videoId = entry?.id || entry?.url || entry?.webpage_url_basename || null;
+      const title = entry?.title || entry?.track || entry?.fulltitle || "";
+      if (!videoId || !title) return null;
+
+      const artists = collectArtistNames(
+        entry?.artist || entry?.artists || entry?.album_artist || entry?.uploader || entry?.channel || entry?.creator || ""
+      );
+      const artist = artists.join(", ");
+      const thumbnail = entry?.thumbnail
+        || entry?.thumbnails?.sort((a, b) => (b.width || 0) - (a.width || 0))?.[0]?.url
+        || null;
+
+      return {
+        videoId,
+        title,
+        artist,
+        authors: artists,
+        artists,
+        album: cleanAlbumTitle(entry?.album || payload?.title || null),
+        albumBrowseId: albumId,
+        artistBrowseId: null,
+        duration: entry?.duration ? Number(entry.duration) * 1000 : null,
+        artworkUrl: thumbnail,
+        thumbnail,
+        uri: entry?.webpage_url || (videoId.startsWith("http") ? videoId : `https://www.youtube.com/watch?v=${videoId}`),
+        source: "youtube",
+        isrc: entry?.isrc || null,
+        explicit: !!entry?.explicit,
+      };
+    })
+    .filter(Boolean);
+}
+
+function collectArtistNames(value) {
+  const raw = Array.isArray(value) ? value : String(value || "").split(/,|&|\//);
+  const names = raw.flatMap((part) => {
+    if (part && typeof part === "object") {
+      return [
+        part.name,
+        part.artist,
+        part.title,
+        part.uploader,
+        part.channel,
+        part.creator,
+      ].filter(Boolean);
+    }
+    return [part];
+  });
+  return [...new Set(names.map((part) => String(part || "").trim()).filter(Boolean))];
+}
+
+async function resolveAlbumArtistFallback(albumName, tracks, ytDlpPayload) {
+  const title = String(albumName || "").trim();
+  if (!title) return null;
+
+  try {
+    const results = await deezer.searchAlbums(title, 5);
+    const match = results.find((album) => {
+      const albumTitle = String(album?.name || "").trim().toLowerCase();
+      return albumTitle === title.toLowerCase();
+    }) || results[0];
+
+    const deezerArtist = String(match?.artists || "").trim();
+    if (deezerArtist) return deezerArtist;
+  } catch (err) {
+    console.warn(`[album] deezer fallback failed for ${title}: ${err.message}`);
+  }
+
+  const trackArtist = collectArtistNames(tracks?.[0]?.artist || tracks?.[0]?.authors || "");
+  if (trackArtist.length) return trackArtist.join(", ");
+
+  const payloadArtist = collectArtistNames(ytDlpPayload?.artist || ytDlpPayload?.album_artist || ytDlpPayload?.uploader || ytDlpPayload?.channel || ytDlpPayload?.creator || "");
+  if (payloadArtist.length) return payloadArtist.join(", ");
+
+  return null;
+}
+
+function enrichAlbumTrack(track, albumArtist, albumName) {
+  if (!track) return track;
+
+  const artists = collectArtistNames(track.artists || track.authors || track.artist || albumArtist || "");
+  const normalizedArtists = artists.length ? artists : collectArtistNames(albumArtist || "");
+  const artist = normalizedArtists.join(", ") || albumArtist || track.artist || "";
+
+  return {
+    ...track,
+    artist,
+    authors: track.authors?.length ? track.authors : normalizedArtists,
+    artists: track.artists?.length ? track.artists : normalizedArtists,
+    album: track.album || albumName || null,
+    albumArtist: track.albumArtist || albumArtist || null,
+    album_artist: track.album_artist || albumArtist || null,
+    trackAuthor: track.trackAuthor || artist,
+    track_author: track.track_author || artist,
+  };
+}
+
+function pickAlbumArtist(resultArtist, tracks, ytDlpPayload) {
+  const explicit = collectArtistNames(resultArtist);
+  if (explicit.length) return explicit.join(", ");
+
+  const payloadArtist = collectArtistNames(ytDlpPayload?.artist || ytDlpPayload?.album_artist || ytDlpPayload?.uploader || ytDlpPayload?.channel || ytDlpPayload?.creator || "");
+  if (payloadArtist.length) return payloadArtist.join(", ");
+
+  const trackArtist = collectArtistNames(tracks?.[0]?.artist || tracks?.[0]?.authors || "");
+  return trackArtist.length ? trackArtist.join(", ") : null;
+}
+
+function buildAlbumPayload(albumId, result, tracks, ytDlpAlbum, albumArtist) {
+  const name = cleanAlbumTitle(result.title || result.albumName || ytDlpAlbum?.title || null);
+  const artworkUrl = result.thumbnail || result.albumArtworkUrl || ytDlpAlbum?.thumbnail || null;
+  const year = result.year || ytDlpAlbum?.release_year || null;
+  const enrichedTracks = tracks.map((track) => enrichAlbumTrack(track, albumArtist, name));
+  const albumArtists = collectArtistNames(result.artists || tracks?.[0]?.artists || tracks?.[0]?.authors || albumArtist || "");
+
+  return {
+    id: albumId,
+    albumId,
+    albumBrowseId: albumId,
+    albumUrl: result.albumUrl || ytDlpAlbum?.albumUrl || `https://music.youtube.com/browse/${albumId}`,
+    tracks: enrichedTracks,
+    name,
+    albumName: name,
+    artist: albumArtist,
+    albumArtist,
+    artists: albumArtists,
+    year,
+    trackCount: result.trackCount || enrichedTracks.length,
+    artworkUrl,
+    album: {
+      id: albumId,
+      albumId,
+      albumBrowseId: albumId,
+      albumUrl: result.albumUrl || ytDlpAlbum?.albumUrl || `https://music.youtube.com/browse/${albumId}`,
+      name,
+      artist: albumArtist,
+      artists: albumArtists,
+      year,
+      trackCount: result.trackCount || enrichedTracks.length,
+      artworkUrl,
+    },
+  };
+}
+
+function cleanAlbumTitle(value) {
+  return String(value || "")
+    .replace(/^\s*(?:album|single|ep|compilation)\s*[-–—:]\s*/i, "")
+    .replace(/^\s*(?:album|single|ep|compilation)\s+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 const STREAM_CACHE_MAX = 200;
@@ -254,6 +662,42 @@ const metadataPoolInFlight = new Map();
 const metadataSyncCache = new Map();
 const METADATA_SYNC_CACHE_TTL = 30_000;
 const metadataSyncInFlight = new Map();
+
+async function repairLikedSongAlbums(userId, source, limit = 25) {
+  const likedSongs = await db.getLikedSongs(userId, limit, source).catch(() => []);
+  const missingAlbum = likedSongs.filter((song) => !song.album && !song.album_name);
+  if (!missingAlbum.length) return 0;
+
+  let repaired = 0;
+  for (const song of missingAlbum) {
+    const title = String(song.track_title || song.trackTitle || "").trim();
+    const artist = String(song.track_author || song.trackAuthor || "").trim();
+    if (!title || !artist) continue;
+
+    try {
+      const enriched = await metadataEnricher.enrichSingleTrack(artist, title, song.isrc || null);
+      if (enriched?.albumName) {
+        await db.updateLikedSongMetadata(userId, song.track_url || song.trackUrl, {
+          albumName: enriched.albumName,
+          albumArtist: enriched.trackAuthor || artist,
+          albumBrowseId: enriched.albumBrowseId || undefined,
+          albumUrl: enriched.albumUrl || undefined,
+          trackAuthors: enriched.featuredArtists?.length ? [artist, ...enriched.featuredArtists] : undefined,
+        }, source);
+        repaired++;
+      }
+    } catch (err) {
+      console.warn(`[likes] album repair failed for ${title} - ${artist}: ${err.message}`);
+    }
+  }
+
+  if (repaired > 0) {
+    console.log(`[likes] repaired ${repaired}/${missingAlbum.length} liked songs with album metadata`);
+  }
+
+  return repaired;
+}
+
 function cleanCache(cache, ttl, max) {
   const now = Date.now();
   for (const [key, entry] of cache) {
@@ -316,7 +760,7 @@ setInterval(() => {
 
 let streamQueuePromise = Promise.resolve();
 
-async function resolveStreamUrl(identifier, req = null, forceRefresh = false, isVideo = false) {
+async function resolveStreamUrl(identifier, req = null, forceRefresh = false, isVideo = false, streamOptions = {}) {
   if (!identifier || typeof identifier !== "string") return null;
 
   // URL de audio directa (Deezer, etc.) → proxylar por el backend
@@ -367,7 +811,7 @@ async function resolveStreamUrl(identifier, req = null, forceRefresh = false, is
             return;
           }
         }
-        const streamUrl = await doResolveStreamUrl(videoId, req, isVideo);
+        const streamUrl = await doResolveStreamUrl(videoId, req, isVideo, streamOptions);
         resolve(streamUrl);
       } catch (err) {
         resolve(null);
@@ -383,18 +827,20 @@ async function resolveStreamUrl(identifier, req = null, forceRefresh = false, is
 
 
 
-async function doResolveStreamUrl(videoId, req = null, isVideo = false) {
+async function doResolveStreamUrl(videoId, req = null, isVideo = false, streamOptions = {}) {
   const cacheKey = isVideo ? `${videoId}:video` : videoId;
 
   // A. InnerTube directo primero: suele responder antes que yt-dlp/play-dl
   try {
-    const streamUrl = await innertube.getStreamUrl(videoId);
-    if (streamUrl) {
+    const streamResult = await innertube.getStreamUrl(videoId, streamOptions);
+    if (streamResult?.url) {
       console.log(`[stream] InnerTube success for ${videoId}`);
-      setCached(cacheKey, streamUrl);
-      return streamUrl;
+      setCached(cacheKey, streamResult.url);
+      return streamResult;
     }
-    console.warn(`[stream] InnerTube returned null for ${videoId} (no streaming data)`);
+    if (streamResult === null) {
+      console.warn(`[stream] InnerTube returned null for ${videoId} (no streaming data)`);
+    }
   } catch (e) {
     console.warn(`[stream] InnerTube failed for ${videoId}: ${e.message}`);
   }
@@ -589,10 +1035,33 @@ const SOURCE_MAP = {
 app.get("/api/search", requireApiKey, async (req, res) => {
   try {
     const q = (req.query.q || "").trim();
+    const userId = req.userId || req.query.userId || "guest";
     const source = SOURCE_MAP[req.query.source] || "ytmsearch";
     if (!q) return res.status(400).json({ error: "Missing query parameter 'q'" });
 
-    const cacheKey = `${source}:${q}`;
+    // Si el query es un browseId (UC..., MP..., etc.), resolver como entidad directamente
+    if (isLikelyBrowseId(q)) {
+      if (q.startsWith("UC") || q.startsWith("PU") || q.startsWith("UU")) {
+        const artistPage = await innertube.getArtistPage(q, userId).catch(() => null);
+        if (artistPage) {
+          return res.json({ query: q, source, tracks: [], continuation: null, browseResult: { type: "artist", data: artistPage } });
+        }
+      }
+      if (q.startsWith("MP") || q.startsWith("OL")) {
+        const album = await innertube.getAlbumDetails(q, userId).catch(() => null);
+        if (album) {
+          return res.json({ query: q, source, tracks: album.tracks || [], continuation: null, browseResult: { type: "album", data: album } });
+        }
+      }
+      if (q.startsWith("VL") || q.startsWith("PL") || q.startsWith("RD")) {
+        const tracks = await innertube.getPlaylistTracks(q, userId).catch(() => []);
+        if (tracks.length) {
+          return res.json({ query: q, source, tracks, continuation: null, browseResult: { type: "playlist", data: { id: q, tracks } } });
+        }
+      }
+    }
+
+    const cacheKey = `${getSessionCacheScope(userId)}:${source}:${q}`;
     const cached = searchCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < SEARCH_CACHE_TTL) {
       return res.json(cached.data);
@@ -606,8 +1075,11 @@ app.get("/api/search", requireApiKey, async (req, res) => {
 
       // InnerTube directo para ytmsearch (sin hop a Lavalink, ~1s)
       let tracks = [];
+      let continuation = null;
       if (source === "ytmsearch") {
-        tracks = await innertube.searchQuery(q);
+        const searchResult = await innertube.searchQueryDetailed(q);
+        tracks = searchResult.items;
+        continuation = searchResult.continuation;
         if (tracks.length) {
           console.log(`[search] InnerTube success source=${source} q="${q}" count=${tracks.length}`);
         } else {
@@ -625,11 +1097,12 @@ app.get("/api/search", requireApiKey, async (req, res) => {
         }
       }
 
-      if (!tracks.length) return { query: q, source, tracks: [] };
+      if (!tracks.length) return { query: q, source, tracks: [], continuation: null };
 
       tracks = await enrichArtworkWithDeezer(tracks);
+      tracks = rankSearchResults(q, tracks);
 
-      const payload = { query: q, source, tracks };
+      const payload = { query: q, source, tracks, continuation: source === "ytmsearch" ? continuation : null };
       searchCache.set(cacheKey, { data: payload, ts: Date.now() });
 
       // Background: enriquecer con Lavalink (encoded, isrc, explicit) + pre-resolver streams
@@ -650,6 +1123,27 @@ app.get("/api/search", requireApiKey, async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error("Search Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/search/continuation", requireApiKey, async (req, res) => {
+  try {
+    const continuation = (req.query.continuation || "").trim();
+    const q = (req.query.q || "").trim();
+    const userId = req.userId || req.query.userId || "guest";
+    const source = SOURCE_MAP[req.query.source] || "ytmsearch";
+    if (!continuation) return res.status(400).json({ error: "Missing continuation parameter" });
+    if (source !== "ytmsearch") return res.json({ query: q, source, tracks: [], continuation: null });
+
+    const result = await innertube.searchContinuationDetailed(continuation);
+    let tracks = result.items || [];
+    tracks = await enrichArtworkWithDeezer(tracks);
+
+    const payload = { query: q, source, tracks, continuation: result.continuation || null };
+    res.json(payload);
+  } catch (err) {
+    console.error("Search continuation error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -694,6 +1188,39 @@ app.get("/api/search/suggestions", requireApiKey, async (req, res) => {
   }
 });
 
+// ── YouTube Music Official Lyrics ─────────────────────────────────────
+// GET /api/lyrics/ytm?videoId=<videoId>
+// Returns: { lyrics, source, credits, footer, syncType } | null
+app.get("/api/lyrics/ytm", requireApiKey, async (req, res) => {
+  try {
+    const { videoId } = req.query;
+    if (!videoId) return res.status(400).json({ error: "Missing 'videoId' parameter" });
+    const userId = req.userId || req.query.userId;
+    const result = await innertube.getYtmLyrics(videoId, userId);
+    res.json(result || { lyrics: null, source: null });
+  } catch (err) {
+    console.error("[lyrics/ytm] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Rich Suggestions (InnerTube) ───────────────────────────────────────
+// GET /api/search/suggestions/rich?q=<query>
+// Returns: { query, suggestions: RichSuggestionDto[] }
+app.get("/api/search/suggestions/rich", requireApiKey, async (req, res) => {
+  try {
+    const q = req.query.q;
+    if (!q || q.trim().length === 0) {
+      return res.json({ query: q || "", suggestions: [] });
+    }
+    const userId = req.userId || req.query.userId;
+    const suggestions = await innertube.getSearchSuggestions(q, userId);
+    res.json({ query: q, suggestions });
+  } catch (err) {
+    console.error("[suggestions/rich] Error:", err.message);
+    res.json({ query: req.query.q || "", suggestions: [] });
+  }
+});
 
 async function searchLavalink(source, query) {
   const url = `${LAVALINK_PROTO}://${LAVALINK_HOST}:${LAVALINK_PORT}/v4/loadtracks?identifier=${encodeURIComponent(source + ":" + query)}`;
@@ -816,9 +1343,10 @@ async function enrichArtworkWithDeezer(tracks) {
 app.get("/api/search/video", requireApiKey, async (req, res) => {
   try {
     const q = (req.query.q || "").trim();
+    const userId = req.userId || req.query.userId || "guest";
     if (!q) return res.status(400).json({ error: "Missing query parameter 'q'" });
 
-    const cacheKey = `ytsearch:video:${q}`;
+    const cacheKey = `${getSessionCacheScope(userId)}:ytsearch:video:${q}`;
     const cached = searchCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < SEARCH_CACHE_TTL) {
       return res.json(cached.data);
@@ -868,6 +1396,7 @@ app.get("/api/search/video", requireApiKey, async (req, res) => {
             title: t.title,
           };
         });
+        tracks = rankSearchResults(q, tracks);
       }
 
       const payload = { query: q, source: "ytsearch", tracks };
@@ -885,7 +1414,7 @@ app.get("/api/search/video", requireApiKey, async (req, res) => {
 app.get("/api/spotify/search", requireApiKey, async (req, res) => {
   try {
     const q = req.query.q;
-    const limit = Math.min(parseInt(req.query.limit) || 5, 20);
+    const limit = Math.min(parseInt(req.query.limit) || 25, 25);
     if (!q) return res.status(400).json({ error: "Missing query parameter 'q'" });
     const tracks = await spotify.searchTracks(q, limit);
     res.json({ query: q, tracks, source: "spotify" });
@@ -897,20 +1426,44 @@ app.get("/api/spotify/search", requireApiKey, async (req, res) => {
 app.get("/api/spotify/search/albums", requireApiKey, async (req, res) => {
   try {
     const q = req.query.q;
-    const limit = Math.min(parseInt(req.query.limit) || 5, 20);
+    const limit = Math.min(parseInt(req.query.limit) || 25, 25);
     if (!q) return res.status(400).json({ error: "Missing query parameter 'q'" });
-    const albums = await spotify.searchAlbums(q, limit);
-    res.json({ query: q, albums, source: "spotify" });
+    const searchResult = await innertube.searchAlbumsDetailed(q, req.userId || req.query.userId || "guest");
+    const albums = (searchResult.items || []).slice(0, limit);
+    console.log(`[search/albums] q="${q}" count=${albums.length} continuation=${searchResult.continuation ? "yes" : "no"}`);
+    res.json({ query: q, albums, source: "youtube_music", continuation: searchResult.continuation || null });
   } catch (err) {
     console.warn(`[spotify/search/albums] Fallback empty for query="${req.query.q || ""}": ${err.message}`);
-    res.json({ query: req.query.q || "", albums: [], source: "spotify", degraded: true });
+    res.json({ query: req.query.q || "", albums: [], source: "youtube_music", degraded: true });
+  }
+});
+
+app.get("/api/spotify/search/albums/continuation", requireApiKey, async (req, res) => {
+  try {
+    const continuation = (req.query.continuation || "").trim();
+    const q = (req.query.q || "").trim();
+    const userId = req.userId || req.query.userId || "guest";
+    if (!continuation) return res.status(400).json({ error: "Missing continuation parameter" });
+
+    const searchResult = await innertube.searchAlbumsContinuationDetailed(continuation, userId);
+    console.log(`[search/albums/continuation] q="${q}" count=${(searchResult.items || []).length} continuation=${searchResult.continuation ? "yes" : "no"}`);
+    const payload = {
+      query: q,
+      source: "youtube_music",
+      albums: searchResult.items || [],
+      continuation: searchResult.continuation || null,
+    };
+    res.json(payload);
+  } catch (err) {
+    console.error("Search albums continuation error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
 app.get("/api/spotify/search/artists", requireApiKey, async (req, res) => {
   try {
     const q = req.query.q;
-    const limit = Math.min(parseInt(req.query.limit) || 5, 20);
+    const limit = Math.min(parseInt(req.query.limit) || 25, 25);
     if (!q) return res.status(400).json({ error: "Missing query parameter 'q'" });
     const artists = await spotify.searchArtistsDirect(q, limit);
     res.json({ query: q, artists, source: "spotify" });
@@ -962,7 +1515,7 @@ app.post("/api/warm", requireApiKey, async (req, res) => {
 
 app.get("/api/stream", requireApiKey, async (req, res) => {
   try {
-    const { id, title, artist, refresh, video } = req.query;
+    const { id, title, artist, refresh, video, poToken, signatureTimestamp } = req.query;
     if (!id || id === "undefined" || id === "null" || id.trim() === "") {
       return res.status(400).json({ error: "Missing or invalid 'id' parameter" });
     }
@@ -971,6 +1524,9 @@ app.get("/api/stream", requireApiKey, async (req, res) => {
     const isVideo = video === "true" || video === "1" || video === "video" ||
                     id.includes("youtube_video") || id.includes("videoUrl") || id.includes(":video");
     const direct = req.query.direct === "true" || req.query.direct === "1";
+    const streamOptions = {};
+    if (poToken) streamOptions.poToken = poToken;
+    if (signatureTimestamp) streamOptions.signatureTimestamp = parseInt(signatureTimestamp, 10) || signatureTimestamp;
 
     const getFinalStreamUrl = (url) => {
       if (!url) return url;
@@ -1024,11 +1580,22 @@ app.get("/api/stream", requireApiKey, async (req, res) => {
       }
     }
 
-    const streamUrl = await resolveStreamUrl(resolvedId, req, forceRefresh, isVideo);
-    if (typeof streamUrl === "string") {
-      return res.json({ url: getFinalStreamUrl(streamUrl) });
+    const streamResult = await resolveStreamUrl(resolvedId, req, forceRefresh, isVideo, streamOptions);
+    if (typeof streamResult === "string") {
+      return res.json({ url: getFinalStreamUrl(streamResult) });
     }
-    if (streamUrl?.blocked) {
+    if (streamResult?.url) {
+      return res.json({
+        url: getFinalStreamUrl(streamResult.url),
+        loudnessDb: streamResult.loudnessDb ?? null,
+        perceptualLoudnessDb: streamResult.perceptualLoudnessDb ?? null,
+        videostatsPlaybackUrl: streamResult.videostatsPlaybackUrl || null,
+        itag: streamResult.itag || null,
+        mimeType: streamResult.mimeType || null,
+        bitrate: streamResult.bitrate || null,
+      });
+    }
+    if (streamResult?.blocked) {
       return res.status(403).json({ error: "Video blocked in this region", blocked: true, videoId: id });
     }
 
@@ -1319,7 +1886,7 @@ app.post("/api/likes/:userId", requireApiKey, async (req, res) => {
   try {
     const userId = req.userId || req.params.userId;
     const connSource = req.provider || "android";
-    let { trackTitle, trackAuthor, trackAuthors, trackUrl, trackDuration, artworkUrl, isrc, explicit, genres, source } = req.body;
+    let { trackTitle, trackAuthor, trackAuthors, album, albumName, albumArtist, albumBrowseId, albumUrl, trackUrl, trackDuration, artworkUrl, isrc, explicit, genres, source } = req.body;
 
     // Separadores para detectar múltiples artistas en trackAuthor y feat.
     const artistSplit = /[,;&]|\s+&\s+|\s+y\s+|\s+e\s+|\s*\/\s*|\s+ duet\s+|\s+x\s+/i;
@@ -1384,8 +1951,22 @@ app.post("/api/likes/:userId", requireApiKey, async (req, res) => {
     trackTitle = trackTitle.replace(featRegex, '').replace(/\s{2,}/, ' ').trim();
 
     const mockTrack = {
-      info: { title: trackTitle, author: trackAuthor, uri: trackUrl || "", duration: trackDuration || 0, artworkUrl: artworkUrl || "", explicit: explicit === true, genres: genres || [], sourceName: source || "ytmsearch" },
-      pluginInfo: { isrc: isrc || null, trackAuthors: trackAuthors || [] }
+      info: {
+        title: trackTitle,
+        author: trackAuthor,
+        uri: trackUrl || "",
+        duration: trackDuration || 0,
+        artworkUrl: artworkUrl || "",
+        explicit: explicit === true,
+        genres: genres || [],
+        sourceName: source || "ytmsearch",
+        album: album || albumName || null,
+        albumName: albumName || album || null,
+        albumArtist: albumArtist || null,
+        albumBrowseId: albumBrowseId || null,
+        albumUrl: albumUrl || null,
+      },
+      pluginInfo: { isrc: isrc || null, trackAuthors: trackAuthors || [], album: album || albumName || null, albumName: albumName || album || null, albumArtist: albumArtist || null, albumBrowseId: albumBrowseId || null, albumUrl: albumUrl || null }
     };
     const added = await db.addLikedSong(userId, mockTrack, connSource);
     res.json({ added });
@@ -1395,14 +1976,33 @@ app.post("/api/likes/:userId", requireApiKey, async (req, res) => {
     // Clear home cache for instant updates
     homeAggregatorService.clearUserCache(userId, connSource);
 
-    // Auto-enrich en background
+    // Auto-enrich en background — fusiona metadatos sin empeorar los existentes
     setImmediate(async () => {
       try {
         const enriched = await metadataEnricher.enrichSingleTrack(trackAuthor, trackTitle, isrc);
         if (enriched && enriched.confidence >= 3) {
-          await db.updateLikedSongMetadata(userId, trackUrl, enriched, connSource);
-          emitLibraryChanged(userId, connSource, "like-enriched", { trackUrl });
-          console.log(`[MetadataPool] Auto-enriched liked track: ${trackTitle} - ${trackAuthor}`);
+          const updates = {};
+          // artworkUrl: solo si el usuario NO envió una (la suya es la correcta, ej. portada de álbum)
+          if (enriched.artworkUrl && !artworkUrl) updates.artworkUrl = enriched.artworkUrl;
+          if (enriched.explicit !== undefined) updates.explicit = enriched.explicit;
+          if (enriched.genres?.length) updates.genres = enriched.genres;
+          // trackTitle: solo actualizar si el original tiene "feat." o está vacío
+          if (!trackTitle || /feat\.?|ft\.?|featuring|with/i.test(trackTitle)) {
+            if (enriched.trackTitle) updates.trackTitle = enriched.trackTitle;
+          }
+          // trackAuthor: solo si el original está vacío
+          if (!trackAuthor && enriched.trackAuthor) {
+            updates.trackAuthor = enriched.trackAuthor;
+          }
+          // trackAuthors: solo si el enriquecido tiene MÁS artistas que el original
+          if (enriched.trackAuthors?.length > trackAuthors.length) {
+            updates.trackAuthors = enriched.trackAuthors;
+          }
+          if (Object.keys(updates).length > 0) {
+            await db.updateLikedSongMetadata(userId, trackUrl, updates, connSource);
+            emitLibraryChanged(userId, connSource, "like-enriched", { trackUrl });
+            console.log(`[MetadataPool] Auto-enriched liked track: ${trackTitle} - ${trackAuthor}`);
+          }
         }
       } catch (e) {
         console.warn(`[MetadataPool] Auto-enrich failed for ${trackTitle}: ${e.message}`);
@@ -1589,19 +2189,56 @@ app.post("/api/playlists/:userId", requireApiKey, async (req, res) => {
 app.get("/api/playlist/:playlistId/tracks", requireApiKey, async (req, res) => {
   try {
     const playlistId = req.params.playlistId;
+    const normalizedPlaylistId = playlistId.replace(/^VL/, "");
     const userId = req.userId || req.query.userId || "guest";
-    if (!playlistId) return res.status(400).json({ error: "Missing playlistId" });
+    if (!normalizedPlaylistId) return res.status(400).json({ error: "Missing playlistId" });
 
     let tracks = [];
-    if (playlistId.startsWith("PL") || playlistId.startsWith("VL") || playlistId.startsWith("RD")) {
-      tracks = await innertube.getPlaylistTracks(playlistId, userId);
+    if (normalizedPlaylistId.startsWith("RD")) {
+      const seedVideoId = normalizedPlaylistId.slice(2);
+      const radioQueue = seedVideoId ? await innertube.getRadioQueue(seedVideoId, userId) : null;
+      tracks = radioQueue ? innertube.parsePlaylistPanel(radioQueue) : [];
     } else {
-      tracks = await spotify.getPlaylist(playlistId);
+      tracks = await innertube.getPlaylistTracks(normalizedPlaylistId, userId);
+      if (!tracks.length && !normalizedPlaylistId.startsWith("PL")) {
+        tracks = await spotify.getPlaylist(normalizedPlaylistId);
+      }
     }
     
-    res.json({ id: playlistId, tracks });
+    res.json({ id: normalizedPlaylistId, tracks });
   } catch (err) {
     console.error("[playlist/tracks] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/radio/:seedVideoId/tracks", requireApiKey, async (req, res) => {
+  try {
+    const seedVideoId = req.params.seedVideoId;
+    const userId = req.userId || req.query.userId || "guest";
+    if (!seedVideoId) return res.status(400).json({ error: "Missing seedVideoId" });
+
+    const radioQueue = await innertube.getRadioQueue(seedVideoId, userId);
+    const tracks = radioQueue ? innertube.parsePlaylistPanel(radioQueue) : [];
+    res.json({ id: `RD${seedVideoId}`, seedVideoId, tracks });
+  } catch (err) {
+    console.error("[radio/tracks] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Related Sections (from /next endpoint) ─────────────────────────────
+// GET /api/related/sections?videoId=<videoId>
+// Returns: { sections: [{ title, items: [...] }] }
+app.get("/api/related/sections", requireApiKey, async (req, res) => {
+  try {
+    const { videoId } = req.query;
+    if (!videoId) return res.status(400).json({ error: "Missing 'videoId' parameter" });
+    const userId = req.userId || req.query.userId;
+    const sections = await innertube.getRelatedSections(videoId, userId);
+    res.json({ sections });
+  } catch (err) {
+    console.error("[related/sections] Error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1612,8 +2249,70 @@ app.get("/api/album/:albumId", requireApiKey, async (req, res) => {
     const userId = req.userId || req.query.userId || "guest";
     if (!albumId) return res.status(400).json({ error: "Missing albumId" });
 
-    const tracks = await innertube.getAlbumTracks(albumId, userId);
-    res.json({ id: albumId, tracks });
+    const cacheKey = getAlbumResponseCacheKey(albumId, userId);
+    const cached = albumResponseCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < ALBUM_RESPONSE_CACHE_TTL) {
+      return res.json(cached.data);
+    }
+
+    if (albumResponseInFlight.has(cacheKey)) {
+      const pending = await albumResponseInFlight.get(cacheKey);
+      if (!pending) return res.status(404).json({ error: "Album not found" });
+      return res.json(pending);
+    }
+
+    const inFlight = (async () => {
+      const result = await innertube.getAlbumDetails(albumId, userId);
+      if (!result) return null;
+
+      let tracks = Array.isArray(result.tracks) ? result.tracks : [];
+      let ytDlpAlbum = null;
+
+      if (!tracks.length) {
+        const albumUrl = `https://music.youtube.com/browse/${albumId}`;
+        console.log(`[album] yt-dlp fallback for ${albumId}`);
+        ytDlpAlbum = await ytDlpGetJson(albumUrl).catch((err) => {
+          console.warn(`[album] yt-dlp fallback failed for ${albumId}: ${err.message}`);
+          return null;
+        });
+        if (!ytDlpAlbum && result.albumUrl && result.albumUrl !== albumUrl) {
+          console.log(`[album] retrying yt-dlp via result.albumUrl for ${albumId}`);
+          ytDlpAlbum = await ytDlpGetJson(result.albumUrl).catch((err) => {
+            console.warn(`[album] yt-dlp fallback failed for ${albumId}: ${err.message}`);
+            return null;
+          });
+        }
+        tracks = normalizeYtDlpAlbumTracks(ytDlpAlbum, albumId);
+        if (tracks.length) {
+          console.log(`[album] yt-dlp fallback resolved ${tracks.length} tracks for ${albumId}`);
+        }
+      }
+
+      let albumArtist = pickAlbumArtist(
+        result.artists?.length ? result.artists : result.artist || null,
+        tracks,
+        ytDlpAlbum,
+      );
+      if (!albumArtist) {
+        albumArtist = await resolveAlbumArtistFallback(result.title || result.albumName || ytDlpAlbum?.title || "", tracks, ytDlpAlbum);
+      }
+      const payload = buildAlbumPayload(albumId, result, tracks, ytDlpAlbum, albumArtist);
+      const firstTrack = payload.tracks?.[0];
+      console.log(
+        `[album] ${albumId} artist=${payload.artist || 'null'} tracks=${payload.trackCount || 0} first=${firstTrack?.title || 'null'} / ${firstTrack?.artist || 'null'} / ${Array.isArray(firstTrack?.authors) ? firstTrack.authors.join(', ') : 'null'}`
+      );
+      albumResponseCache.set(cacheKey, { data: payload, ts: Date.now() });
+      return payload;
+    })();
+
+    albumResponseInFlight.set(cacheKey, inFlight);
+    try {
+      const payload = await inFlight;
+      if (!payload) return res.status(404).json({ error: "Album not found" });
+      return res.json(payload);
+    } finally {
+      albumResponseInFlight.delete(cacheKey);
+    }
   } catch (err) {
     console.error("[album] Error:", err.message);
     res.status(500).json({ error: err.message });
@@ -1745,6 +2444,23 @@ app.get("/api/artist/info", requireApiKey, async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error("[artist/info] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Artist Browse Page (InnerTube Sections) ────────────────────────────
+// GET /api/artist/browse?browseId=<browseId>
+// Returns: { artist: {...}, sections: [{ title, items: [...] }] }
+app.get("/api/artist/browse", requireApiKey, async (req, res) => {
+  try {
+    const { browseId } = req.query;
+    if (!browseId) return res.status(400).json({ error: "Missing 'browseId' parameter" });
+    const userId = req.userId || req.query.userId;
+    const page = await innertube.getArtistPage(browseId, userId);
+    if (!page) return res.status(404).json({ error: "Artist page not found" });
+    res.json(page);
+  } catch (err) {
+    console.error("[artist/browse] Error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1883,17 +2599,20 @@ app.get("/api/home/sections", requireApiKey, async (req, res) => {
   try {
     const userId = req.userId || req.query.userId || "guest";
     const source = req.provider || req.query.source || "android";
+    const hasYtmCookies = !!(req.headers["x-ytm-cookie"] || req.headers["x-ytm-sapisid"] || req.headers["x-ytm-active"]);
+    const params = req.query.params || null;
     if (userId !== "guest") {
       req.userId = userId;
-      const hasYtmCookies = !!(req.headers["x-ytm-cookie"] || req.headers["x-ytm-sapisid"] || req.headers["x-ytm-active"]);
       extractYtmCookies(req);
       if (hasYtmCookies) {
         homeAggregatorService.clearUserCache(userId, source);
         innertube.clearHomeFeedCache(userId);
       }
     }
-    const result = await homeAggregatorService.getHomeSections(userId, source);
-    res.json({ sections: result?.sections || [] });
+    const result = hasYtmCookies
+      ? await recommendationService.getRawHomeSections(userId, params)
+      : await homeAggregatorService.getHomeSections(userId, source);
+    res.json({ sections: result?.sections || [], chips: result?.chips || [], continuation: result?.continuation || null });
   } catch (err) {
     console.error("Home sections error:", err.message);
     res.status(500).json({ error: err.message });
@@ -1904,17 +2623,20 @@ app.post("/api/home", requireApiKey, async (req, res) => {
   try {
     const userId = req.userId || req.body.userId || "guest";
     const source = req.provider || req.body.source || "android";
+    const hasYtmCookies = !!(req.headers["x-ytm-cookie"] || req.headers["x-ytm-sapisid"] || req.headers["x-ytm-active"]);
+    const params = req.body.params || null;
     if (userId !== "guest") {
       req.userId = userId;
-      const hasYtmCookies = !!(req.headers["x-ytm-cookie"] || req.headers["x-ytm-sapisid"] || req.headers["x-ytm-active"]);
       extractYtmCookies(req);
       if (hasYtmCookies) {
         homeAggregatorService.clearUserCache(userId, source);
         innertube.clearHomeFeedCache(userId);
       }
     }
-    const result = await homeAggregatorService.getHomeSections(userId, source);
-    res.json({ sections: result?.sections || [] });
+    const result = hasYtmCookies
+      ? await recommendationService.getRawHomeSections(userId, params)
+      : await homeAggregatorService.getHomeSections(userId, source);
+    res.json({ sections: result?.sections || [], chips: result?.chips || [], continuation: result?.continuation || null });
   } catch (err) {
     console.error("Home POST error:", err.message);
     res.status(500).json({ error: err.message });
@@ -2047,6 +2769,10 @@ app.get("/api/init", requireAuth, async (req, res) => {
     const source = req.provider || "android";
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
+    await repairLikedSongAlbums(userId, source).catch((err) => {
+      console.warn(`[likes] init repair skipped for ${userId}: ${err.message}`);
+    });
+
     const [userData, likedSongs, likedAlbums, followedArtists, playlists, recentPlayback, stats] = await Promise.all([
       (async () => {
         const UserModel = source === "discord" && DiscordUser ? DiscordUser : User;
@@ -2100,6 +2826,35 @@ app.post("/api/sync", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("Sync Error:", err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Device Sessions (Android/Desktop handoff) ─────────────────────────────────
+app.get("/api/devices", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+    res.json(getUserState(userId));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/devices/activate", requireAuth, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const deviceId = req.body?.deviceId || req.body?.targetDeviceId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+    if (!deviceId) return res.status(400).json({ error: "deviceId is required" });
+
+    const result = transferActiveDevice(userId, deviceId, req.body?.reason || "manual");
+    if (!result.ok) {
+      return res.status(404).json({ error: result.error, state: result.state });
+    }
+
+    res.json(result);
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });

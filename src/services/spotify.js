@@ -370,6 +370,107 @@ function formatLavalinkTrack(t) {
   };
 }
 
+const SEARCH_STOPWORDS = new Set(["the", "a", "an", "and", "of", "for", "to", "de", "del", "la", "el", "los", "las", "y", "en", "feat", "ft"]);
+
+function normalizeSearchText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .replace(/['’`]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeSearchText(value) {
+  return normalizeSearchText(value)
+    .split(" ")
+    .filter((token) => token.length > 1 && !SEARCH_STOPWORDS.has(token));
+}
+
+function countSharedTokens(a, b) {
+  const setB = new Set(b);
+  let count = 0;
+  for (const token of a) {
+    if (setB.has(token)) count++;
+  }
+  return count;
+}
+
+function chooseSeedArtist(query, rankedItems) {
+  if (!Array.isArray(rankedItems) || rankedItems.length === 0) return "";
+  const topItems = rankedItems.slice(0, 6).filter((item) => item.score > 0);
+  if (!topItems.length) return "";
+
+  const counts = new Map();
+  for (const item of topItems) {
+    const artist = normalizeSearchText(item.track?.artist || "");
+    if (!artist) continue;
+    counts.set(artist, (counts.get(artist) || 0) + 1);
+  }
+
+  let winner = "";
+  let bestCount = 0;
+  for (const [artist, count] of counts.entries()) {
+    if (count > bestCount) {
+      winner = artist;
+      bestCount = count;
+    }
+  }
+  return winner;
+}
+
+function scoreSearchCandidate(track, query) {
+  const q = normalizeSearchText(query);
+  const title = normalizeSearchText(track.title || "");
+  const artist = normalizeSearchText(track.artist || "");
+  if (!title) return -Infinity;
+
+  let score = 0;
+  if (title === q) score += 80;
+  else if (title.includes(q) || q.includes(title)) score += 40;
+  else {
+    const titleTokens = tokenizeSearchText(title);
+    const queryTokens = tokenizeSearchText(q);
+    const shared = countSharedTokens(titleTokens, queryTokens);
+    score += Math.min(shared * 8, 24);
+  }
+
+  if (artist && q.includes(artist)) score += 18;
+  if (/\b(topic|official|vevo)\b/i.test(track.artist || "")) score += 8;
+  if (/\b(live|cover|karaoke|slowed|sped up|reverb|demo|edit)\b/i.test(track.title || "")) score -= 18;
+  return score;
+}
+
+function rankSearchCandidates(tracks, query, limit) {
+  const ranked = (tracks || [])
+    .map((track, index) => ({ track, score: scoreSearchCandidate(track, query), index }))
+    .filter((item) => item.score > -Infinity)
+    .sort((a, b) => (b.score - a.score) || (a.index - b.index));
+
+  if (!ranked.length) return [];
+  const seedArtist = chooseSeedArtist(query, ranked);
+  const exact = [];
+  const sameArtist = [];
+  const rest = [];
+
+  const q = normalizeSearchText(query);
+  for (const item of ranked) {
+    const artist = normalizeSearchText(item.track?.artist || "");
+    const title = normalizeSearchText(item.track?.title || "");
+    const isExactTitle = title === q;
+    const isSeedArtist = seedArtist && artist === seedArtist;
+    const shared = countSharedTokens(tokenizeSearchText(`${item.track?.title || ""} ${item.track?.artist || ""}`), tokenizeSearchText(query));
+
+    if (isExactTitle || shared >= Math.max(2, Math.ceil(tokenizeSearchText(query).length / 2))) exact.push(item);
+    else if (isSeedArtist) sameArtist.push(item);
+    else rest.push(item);
+  }
+
+  return [...exact, ...sameArtist, ...rest].slice(0, limit).map((item) => item.track);
+}
+
 async function searchLavalink(source, query, limit = 5) {
   const url = `${LAVALINK_PROTO}://${LAVALINK_HOST}:${LAVALINK_PORT}/v4/loadtracks?identifier=${encodeURIComponent(source + ":" + query)}`;
   const response = await axios.get(url, {
@@ -410,15 +511,16 @@ function formatLavalinkTrack(t) {
   };
 }
 
-async function searchTracks(query, limit = 5) {
-  return searchLavalink("ytmsearch", query, limit);
+async function searchTracks(query, limit = 25) {
+  const tracks = await searchLavalink("ytmsearch", query, Math.max(limit * 3, limit));
+  return rankSearchCandidates(tracks, query, limit);
 }
 
 async function searchAlbums(query, limit = 5) {
-  const tracks = await searchLavalink("ytmsearch", query, limit * 2);
+  const tracks = await searchLavalink("ytmsearch", query, limit * 4);
   const seen = new Set();
   const albums = [];
-  for (const t of tracks) {
+  for (const t of rankSearchCandidates(tracks, query, limit * 4)) {
     const key = t.album || t.title;
     if (!seen.has(key) && albums.length < limit) {
       seen.add(key);

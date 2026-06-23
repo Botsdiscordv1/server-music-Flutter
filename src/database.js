@@ -39,6 +39,10 @@ const likedSongSchema = new mongoose.Schema({
   trackTitle: String,
   trackAuthor: String,
   trackAuthors: { type: [String], default: [] },
+  albumName: String,
+  albumArtist: String,
+  albumBrowseId: String,
+  albumUrl: String,
   trackUrl: String,
   trackDuration: Number,
   artworkUrl: String,
@@ -384,11 +388,19 @@ async function addLikedSong(userId, track, source = "android") {
     const sourceName = track.info.sourceName || "ytmsearch";
     const contentType = sourceName === "youtube_video" ? "VIDEO" : "AUDIO";
     const trackAuthors = track.pluginInfo?.trackAuthors || track.info?.authors || [];
+    const albumName = track.info.album || track.info.albumName || track.pluginInfo?.album || track.pluginInfo?.albumName || null;
+    const albumArtist = track.info.albumArtist || track.pluginInfo?.albumArtist || null;
+    const albumBrowseId = track.info.albumBrowseId || track.pluginInfo?.albumBrowseId || null;
+    const albumUrl = track.info.albumUrl || track.pluginInfo?.albumUrl || null;
     await LikedSong.create({
       userId,
       trackTitle: track.info.title,
       trackAuthor: cleanAuthor(track.info.author),
       trackAuthors: trackAuthors.length ? trackAuthors : undefined,
+      albumName: albumName || undefined,
+      albumArtist: cleanAuthor(albumArtist) || undefined,
+      albumBrowseId: albumBrowseId || undefined,
+      albumUrl: albumUrl || undefined,
       trackUrl: track.info.uri,
       trackDuration: track.info.duration,
       artworkUrl: track.info.artworkUrl,
@@ -459,6 +471,13 @@ async function getLikedSongs(userId, limit = 0, source = "android", contentType 
     track_title: doc.trackTitle,
     track_author: doc.trackAuthor,
     track_authors: doc.trackAuthors || [],
+    album: doc.albumName || null,
+    album_name: doc.albumName || null,
+    album_artist: doc.albumArtist || null,
+    albumBrowseId: doc.albumBrowseId || null,
+    album_browse_id: doc.albumBrowseId || null,
+    albumUrl: doc.albumUrl || null,
+    album_url: doc.albumUrl || null,
     track_url: doc.trackUrl,
     track_duration: doc.trackDuration,
     artwork_url: doc.artworkUrl,
@@ -827,6 +846,10 @@ async function updateLikedSongMetadata(userId, trackUrl, updates, source = "andr
   if (updates.trackTitle) setFields.trackTitle = updates.trackTitle;
   if (updates.trackAuthor) setFields.trackAuthor = updates.trackAuthor;
   if (updates.trackAuthors) setFields.trackAuthors = updates.trackAuthors;
+  if (updates.albumName) setFields.albumName = updates.albumName;
+  if (updates.albumArtist) setFields.albumArtist = updates.albumArtist;
+  if (updates.albumBrowseId) setFields.albumBrowseId = updates.albumBrowseId;
+  if (updates.albumUrl) setFields.albumUrl = updates.albumUrl;
   if (updates.artworkUrl) setFields.artworkUrl = updates.artworkUrl;
   if (updates.explicit !== undefined) setFields.explicit = updates.explicit;
   if (updates.genres) setFields.genres = updates.genres;
@@ -975,6 +998,10 @@ async function syncUserData(userId, localData, source = "android") {
           trackTitle: song.trackTitle || song.track_title || "",
           trackAuthor: cleanAuthor(song.trackAuthor || song.track_author || ""),
           trackAuthors: incomingTrackAuthors.length ? incomingTrackAuthors : undefined,
+          albumName: song.album || song.album_name || undefined,
+          albumArtist: song.albumArtist || song.album_artist || undefined,
+          albumBrowseId: song.albumBrowseId || song.album_browse_id || undefined,
+          albumUrl: song.albumUrl || song.album_url || undefined,
           trackUrl: song.trackUrl || song.track_url || "",
           trackDuration: song.trackDuration || song.track_duration || 0,
           artworkUrl: song.artworkUrl || song.artwork_url || "",
@@ -989,13 +1016,20 @@ async function syncUserData(userId, localData, source = "android") {
     }
     const all = await LikedSong.find({ userId }).sort({ likedAt: -1 }).lean();
     result.likedSongs = all.map(s => ({
-      id: s._id.toString(),
-      track_title: s.trackTitle,
-      track_author: s.trackAuthor,
-      track_authors: s.trackAuthors || [],
-      track_url: s.trackUrl,
-      track_duration: s.trackDuration,
-      artwork_url: s.artworkUrl,
+        id: s._id.toString(),
+        track_title: s.trackTitle,
+        track_author: s.trackAuthor,
+        track_authors: s.trackAuthors || [],
+        album: s.albumName || null,
+        album_name: s.albumName || null,
+        album_artist: s.albumArtist || null,
+        albumBrowseId: s.albumBrowseId || null,
+        album_browse_id: s.albumBrowseId || null,
+        albumUrl: s.albumUrl || null,
+        album_url: s.albumUrl || null,
+        track_url: s.trackUrl,
+        track_duration: s.trackDuration,
+        artwork_url: s.artworkUrl,
       isrc: s.isrc,
       explicit: s.explicit || false,
       genres: s.genres || [],
