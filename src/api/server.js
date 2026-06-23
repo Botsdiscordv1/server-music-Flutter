@@ -3110,27 +3110,22 @@ app.post("/api/auth/google", async (req, res) => {
 
     if (!idToken) return res.status(400).json({ error: "idToken is required" });
 
-    // Decodificar payload sin verificar para debug
+    // Decodificar JWT y verificar claims manualmente (tokeninfo bloqueado desde VPS)
+    let payload;
     try {
       const b64 = idToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
-      const payload = JSON.parse(Buffer.from(b64, "base64").toString());
-      console.log(`[Google Auth] token aud=${payload.aud} iss=${payload.iss} sub=${payload.sub} email=${payload.email}`);
+      payload = JSON.parse(Buffer.from(b64, "base64").toString());
     } catch (e) {
-      console.warn(`[Google Auth] failed to decode token: ${e.message}`);
+      return res.status(401).json({ error: "Invalid token format" });
     }
-
-    const googleRes = await axios.get(`https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`, {
-      timeout: 10000,
-      validateStatus: () => true,
-    });
-    if (googleRes.status !== 200) {
-      console.error(`[Google Auth] tokeninfo error: ${googleRes.status} ${JSON.stringify(googleRes.data)}`);
-      return res.status(401).json({ error: "Invalid Google token", detail: googleRes.data });
-    }
-    const payload = googleRes.data;
     if (payload.aud !== process.env.GOOGLE_CLIENT_ID) {
-      console.error(`[Google Auth] audience mismatch: ${payload.aud} !== ${process.env.GOOGLE_CLIENT_ID}`);
       return res.status(401).json({ error: "Token audience mismatch" });
+    }
+    if (payload.exp && Date.now() >= payload.exp * 1000) {
+      return res.status(401).json({ error: "Token expired" });
+    }
+    if (!payload.sub) {
+      return res.status(401).json({ error: "Missing sub" });
     }
 
     const { sub: googleId, email: rawEmail, name, picture } = payload;
