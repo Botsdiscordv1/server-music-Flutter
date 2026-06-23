@@ -3110,12 +3110,19 @@ app.post("/api/auth/google", async (req, res) => {
 
     if (!idToken) return res.status(400).json({ error: "idToken is required" });
 
-    // Verificar token con Google API (Sin librerías extra)
-    const googleRes = await axios.get(`https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`);
+    // Verificar token con Google API
+    const googleRes = await axios.get(`https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`, {
+      timeout: 10000,
+      validateStatus: () => true,
+    });
+    if (googleRes.status !== 200) {
+      console.error(`[Google Auth] tokeninfo error: ${googleRes.status} ${JSON.stringify(googleRes.data)}`);
+      return res.status(401).json({ error: "Invalid Google token", detail: googleRes.data });
+    }
     const payload = googleRes.data;
-
-    if (!payload || googleRes.status !== 200) {
-      return res.status(401).json({ error: "Invalid Google token" });
+    if (payload.aud !== process.env.GOOGLE_CLIENT_ID) {
+      console.error(`[Google Auth] audience mismatch: ${payload.aud} !== ${process.env.GOOGLE_CLIENT_ID}`);
+      return res.status(401).json({ error: "Token audience mismatch" });
     }
 
     const { sub: googleId, email: rawEmail, name, picture } = payload;
