@@ -203,12 +203,11 @@ function resolveClientConfig(clientName = INNERTUBE_CLIENT) {
 }
 
 const PLAYER_STREAM_CLIENTS = [
+  "ANDROID_VR",
   "ANDROID_MUSIC",
-  "ANDROID_VR_NO_AUTH",
   "IOS",
   "IOS_MUSIC",
   "MOBILE",
-  "TVHTML5",
   "TVHTML5",
 ];
 
@@ -590,7 +589,7 @@ async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clien
     browse: "WEB_REMIX",
     search: "WEB_REMIX",
     next: "ANDROID_MUSIC",
-    player: "ANDROID_MUSIC",
+    player: "ANDROID_VR",
     music_get_search_suggestions: "WEB_REMIX",
   };
   // IOS_MUSIC como fallback si ANDROID_MUSIC falla en player
@@ -629,8 +628,8 @@ async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clien
         return await apiRequest(endpoint, data, query, userId, false, clientNameOverride);
       }
       if (err.response.status === 500 && !clientNameOverride && effectiveClient === "ANDROID_VR") {
-        console.warn(`[InnerTube] ANDROID_VR ${endpoint} failed, retrying with WEB_REMIX`);
-        return await apiRequest(endpoint, data, query, userId, includeAuth, "WEB_REMIX");
+        console.warn(`[InnerTube] ANDROID_VR ${endpoint} failed, retrying with ANDROID_MUSIC`);
+        return await apiRequest(endpoint, data, query, userId, includeAuth, "ANDROID_MUSIC");
       }
       // IOS_MUSIC fallback for player on 5xx
       if ((err.response.status === 500 || err.response.status === 503) && effectiveClient === "ANDROID_MUSIC" && !clientNameOverride) {
@@ -1479,26 +1478,26 @@ async function getSignatureTimestamp() {
     return cachedSigTimestamp;
   }
   try {
-    const res = await axios.get(`${YT_BASE}/`, {
-      headers: { "User-Agent": USER_AGENT },
+    const res = await axios.get(`${YTM_BASE}/`, {
+      headers: { "User-Agent": USER_AGENT_WEB },
       timeout: 10000,
     });
     const match = res.data.match(/"signatureTimestamp":(\d+)/);
     if (match) {
       cachedSigTimestamp = parseInt(match[1], 10);
-      cachedSigTimestampExpiry = Date.now() + 6 * 60 * 60 * 1000; // 6 hours
+      cachedSigTimestampExpiry = Date.now() + 60 * 60 * 1000; // 1 hour
       return cachedSigTimestamp;
     }
     const match2 = res.data.match(/signatureTimestamp[=:]+(\d+)/);
     if (match2) {
       cachedSigTimestamp = parseInt(match2[1], 10);
-      cachedSigTimestampExpiry = Date.now() + 6 * 60 * 60 * 1000;
+      cachedSigTimestampExpiry = Date.now() + 60 * 60 * 1000;
       return cachedSigTimestamp;
     }
   } catch {}
   const fallback = Math.floor(Date.now() / 1000 / 3600) * 3600;
   cachedSigTimestamp = fallback;
-  cachedSigTimestampExpiry = Date.now() + 60 * 60 * 1000; // cache fallback 1h
+  cachedSigTimestampExpiry = Date.now() + 30 * 60 * 1000; // fallback 30min
   return fallback;
 }
 
@@ -1518,43 +1517,44 @@ async function getPlayer(videoId, options = {}) {
   const isLoggedIn = !!(resolveCookieString(options.userId));
   let lastError = null;
 
-  // Priorizar clientes: los que soportan login primero si logueado
-  const clients = isLoggedIn
-    ? [...PLAYER_STREAM_CLIENTS].sort((a, b) => (PLAYER_LOGGED_IN_FILTER.has(b) ? 1 : 0) - (PLAYER_LOGGED_IN_FILTER.has(a) ? 1 : 0))
-    : PLAYER_STREAM_CLIENTS;
+  // Lanzar todos los clientes en paralelo, tomar el primero que responda con streamingData
+  const clients = [...new Set(PLAYER_STREAM_CLIENTS)].filter(clientName => {
+    if (isStreamClientBlocked(videoId, clientName)) return false;
+    if (!isLoggedIn && PLAYER_LOGGED_IN_FILTER.has(clientName)) return false;
+    return true;
+  });
 
-  for (const clientName of [...new Set(clients)]) {
-    if (isStreamClientBlocked(videoId, clientName)) continue;
-    if (!isLoggedIn && PLAYER_LOGGED_IN_FILTER.has(clientName) && clientName !== "ANDROID_VR_NO_AUTH") {
-      continue; // skip login-required clients
-    }
+  const results = await Promise.allSettled(clients.map(async (clientName) => {
+    const body = {
+      videoId,
+      playbackContext: {
+        contentPlaybackContext: { signatureTimestamp },
+      },
+      serviceIntegrityDimensions: { poToken: localPoToken },
+      thirdPartyUploadUrlSupport: false,
+    };
     try {
-      const body = {
-        videoId,
-        playbackContext: {
-          contentPlaybackContext: { signatureTimestamp },
-        },
-        serviceIntegrityDimensions: { poToken: localPoToken },
-        thirdPartyUploadUrlSupport: false,
-      };
       const data = await apiRequest("player", body, {}, options.userId, true, clientName);
-      if (data?.streamingData) {
-        const expiresInSeconds = data.streamingData?.expiresInSeconds || 21600;
-        playerCache.set(cacheKey, { data, ts: Date.now(), expiresInSeconds, expiresAt: Date.now() + (expiresInSeconds * 1000) });
-        return data;
-      }
+      if (data?.streamingData) return { clientName, data };
       if (data?.playabilityStatus?.status !== "OK") {
-        lastError = new Error(data?.playabilityStatus?.reason || "playability not OK");
-        continue;
+        throw new Error(data?.playabilityStatus?.reason || "playability not OK");
       }
+      throw new Error("No streaming data");
     } catch (err) {
-      lastError = err;
-      const status = err?.response?.status;
-      if (status === 403) markStreamClientFailed(videoId, clientName);
-      if (status === 400 && err?.response?.data?.error?.message?.includes?.("INVALID_ARGUMENT")) {
-        // retry without dataSyncId handled inside apiRequest
-      }
-      continue;
+      if (err?.response?.status === 403) markStreamClientFailed(videoId, clientName);
+      throw err;
+    }
+  }));
+
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value.data?.streamingData) {
+      const { data, clientName } = r.value;
+      const expiresInSeconds = data.streamingData?.expiresInSeconds || 21600;
+      playerCache.set(cacheKey, { data, ts: Date.now(), expiresInSeconds, expiresAt: Date.now() + (expiresInSeconds * 1000) });
+      return data;
+    }
+    if (r.status === "rejected") {
+      lastError = r.reason;
     }
   }
 
@@ -1922,6 +1922,21 @@ function parsePlaylistPanel(data) {
   return results;
 }
 
+function extractPlaylistHeader(data) {
+  const header = findDeep(data, node => node?.musicDetailHeaderRenderer || node?.musicResponsiveHeaderRenderer || node?.musicPlaylistShelfRenderer);
+  const renderer = header?.musicDetailHeaderRenderer || header?.musicResponsiveHeaderRenderer || {};
+  const title = renderer?.title?.runs?.map(r => r.text).join("") || renderer?.title?.simpleText || "";
+  const thumbnails = renderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails
+    || renderer?.thumbnail?.thumbnails || [];
+  const artworkUrl = thumbnails.length ? thumbnails[thumbnails.length - 1]?.url : null;
+  const subtitleRuns = renderer?.straplineTextOne?.runs || renderer?.subtitle?.runs || [];
+  const description = Array.isArray(subtitleRuns)
+    ? subtitleRuns.map(r => r.text).filter(Boolean).join("").replace(/\s*[•|]\s*/g, " • ").trim()
+    : "";
+  const artist = renderer?.straplineTextTwo?.runs?.map(r => r.text).filter(Boolean).join(", ") || description;
+  return { title, description, artworkUrl, artist };
+}
+
 async function getPlaylistTracks(playlistId, userId) {
   const cacheKey = `${userId || "__global__"}:${playlistId}`;
   const cached = playlistTracksCache.get(cacheKey);
@@ -1935,16 +1950,20 @@ async function getPlaylistTracks(playlistId, userId) {
   const inFlight = (async () => {
     try {
       const normalizedPlaylistId = playlistId.replace(/^VL/, "");
-      const browseCandidates = normalizedPlaylistId.startsWith("RD")
+      const browseCandidates = (normalizedPlaylistId.startsWith("RD") || normalizedPlaylistId.startsWith("RDCLAK"))
         ? [normalizedPlaylistId]
         : normalizedPlaylistId.startsWith("PL")
           ? [`VL${normalizedPlaylistId}`, normalizedPlaylistId]
           : [normalizedPlaylistId, `VL${normalizedPlaylistId}`];
 
+      let header = null;
+
       for (const browseId of [...new Set(browseCandidates.filter(Boolean))]) {
         try {
           const data = await apiRequestWithBrowseFallback({ browseId }, {}, userId);
           if (!data) continue;
+
+          if (!header) header = extractPlaylistHeader(data);
 
           const tracks = [];
           const queue = [data];
@@ -1983,18 +2002,25 @@ async function getPlaylistTracks(playlistId, userId) {
 
           const deduped = dedupeTracks(tracks);
           if (deduped.length) {
-            playlistTracksCache.set(cacheKey, { data: deduped, ts: Date.now() });
-            return deduped;
+            const envelope = {
+              id: normalizedPlaylistId,
+              title: header?.title || "",
+              description: header?.description || "",
+              artworkUrl: header?.artworkUrl || deduped[0]?.artworkUrl || null,
+              tracks: deduped,
+            };
+            playlistTracksCache.set(cacheKey, { data: envelope, ts: Date.now() });
+            return envelope;
           }
         } catch (err) {
           console.warn(`[InnerTube] getPlaylistTracks candidate ${browseId} failed for ${playlistId}: ${err.message}`);
         }
       }
 
-      return [];
+      return { id: normalizedPlaylistId, title: "", description: "", artworkUrl: null, tracks: [] };
     } catch (err) {
       console.warn(`[InnerTube] getPlaylistTracks failed for ${playlistId}: ${err.message}`);
-      return [];
+      return { id: normalizedPlaylistId, title: "", description: "", artworkUrl: null, tracks: [] };
     }
   })();
 

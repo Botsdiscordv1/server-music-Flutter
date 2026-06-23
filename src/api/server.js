@@ -526,7 +526,10 @@ function pickAlbumArtist(resultArtist, tracks, ytDlpPayload) {
 
 function buildAlbumPayload(albumId, result, tracks, ytDlpAlbum, albumArtist) {
   const name = cleanAlbumTitle(result.title || result.albumName || ytDlpAlbum?.title || null);
-  const artworkUrl = result.thumbnail || result.albumArtworkUrl || ytDlpAlbum?.thumbnail || null;
+  const ytDlpThumb = ytDlpAlbum?.thumbnail
+    || ytDlpAlbum?.thumbnails?.sort((a, b) => (b.width || 0) - (a.width || 0))?.[0]?.url
+    || null;
+  const artworkUrl = result.thumbnail || result.albumArtworkUrl || ytDlpThumb || null;
   const year = result.year || ytDlpAlbum?.release_year || null;
   const enrichedTracks = tracks.map((track) => enrichAlbumTrack(track, albumArtist, name));
   const albumArtists = collectArtistNames(result.artists || tracks?.[0]?.artists || tracks?.[0]?.authors || albumArtist || "");
@@ -545,6 +548,13 @@ function buildAlbumPayload(albumId, result, tracks, ytDlpAlbum, albumArtist) {
     year,
     trackCount: result.trackCount || enrichedTracks.length,
     artworkUrl,
+    header: {
+      title: name,
+      artist: albumArtist,
+      artworkUrl,
+      year,
+      trackCount: result.trackCount || enrichedTracks.length,
+    },
     album: {
       id: albumId,
       albumId,
@@ -845,7 +855,33 @@ async function doResolveStreamUrl(videoId, req = null, isVideo = false, streamOp
     console.warn(`[stream] InnerTube failed for ${videoId}: ${e.message}`);
   }
 
-  // B. yt-dlp (no funciona en Render sin cookies, YouTube bloquea IPs de datacenter)
+  // B. play-dl (audio, ligero — sin spawn de procesos)
+  if (!isVideo) {
+    try {
+      const info = await play.video_info(`https://www.youtube.com/watch?v=${videoId}`).catch(async () => {
+        const search = await play.search(videoId, { limit: 1 });
+        return search[0] ? await play.video_info(search[0].url) : null;
+      });
+      if (info) {
+        const stream = await play.stream_from_info(info, { quality: 2, discordPlayerCompatibility: true });
+        if (stream?.url) {
+          setCached(cacheKey, stream.url);
+          return stream.url;
+        }
+      }
+    } catch (e) {
+      console.warn(`[stream] play-dl failed for ${videoId}: ${e.message}`);
+    }
+  }
+
+  // C. Cobalt fallback (APIs paralelas, ligeras)
+  const fallback = await resolveViaCobalt(videoId, isVideo);
+  if (fallback) {
+    setCached(cacheKey, fallback);
+    return fallback;
+  }
+
+  // D. yt-dlp (fallback final: pesado en CPU, solo cuando todo lo demás falló)
   if (!IS_RENDER || hasYtCookies) {
     try {
       const streamUrl = await ytDlpGetUrl(`https://www.youtube.com/watch?v=${videoId}`, isVideo);
@@ -862,32 +898,6 @@ async function doResolveStreamUrl(videoId, req = null, isVideo = false, streamOp
       }
       console.warn(`[stream] yt-dlp failed for ${videoId}: ${msg}`);
     }
-
-    // C. play-dl (audio)
-    if (!isVideo) {
-      try {
-        const info = await play.video_info(`https://www.youtube.com/watch?v=${videoId}`).catch(async () => {
-          const search = await play.search(videoId, { limit: 1 });
-          return search[0] ? await play.video_info(search[0].url) : null;
-        });
-        if (info) {
-          const stream = await play.stream_from_info(info, { quality: 2, discordPlayerCompatibility: true });
-          if (stream?.url) {
-            setCached(cacheKey, stream.url);
-            return stream.url;
-          }
-        }
-      } catch (e) {
-        console.warn(`[stream] play-dl failed for ${videoId}: ${e.message}`);
-      }
-    }
-  }
-
-  // D. Cobalt fallback
-  const fallback = await resolveViaCobalt(videoId, isVideo);
-  if (fallback) {
-    setCached(cacheKey, fallback);
-    return fallback;
   }
 
   // E. Fallback agotado
@@ -1047,16 +1057,16 @@ app.get("/api/search", requireApiKey, async (req, res) => {
           return res.json({ query: q, source, tracks: [], continuation: null, browseResult: { type: "artist", data: artistPage } });
         }
       }
-      if (q.startsWith("MP") || q.startsWith("OL")) {
+      if (q.startsWith("MP") || q.startsWith("OL") || q.startsWith("OLAK")) {
         const album = await innertube.getAlbumDetails(q, userId).catch(() => null);
         if (album) {
           return res.json({ query: q, source, tracks: album.tracks || [], continuation: null, browseResult: { type: "album", data: album } });
         }
       }
-      if (q.startsWith("VL") || q.startsWith("PL") || q.startsWith("RD")) {
-        const tracks = await innertube.getPlaylistTracks(q, userId).catch(() => []);
-        if (tracks.length) {
-          return res.json({ query: q, source, tracks, continuation: null, browseResult: { type: "playlist", data: { id: q, tracks } } });
+      if (q.startsWith("VL") || q.startsWith("PL") || q.startsWith("RD") || q.startsWith("RDCLAK")) {
+        const result = await innertube.getPlaylistTracks(q, userId).catch(() => ({ id: q, title: "", description: "", artworkUrl: null, tracks: [] }));
+        if (result.tracks.length) {
+          return res.json({ query: q, source, tracks: result.tracks, header: { title: result.title, description: result.description, artworkUrl: result.artworkUrl }, continuation: null, browseResult: { type: "playlist", data: result } });
         }
       }
     }
@@ -2193,19 +2203,19 @@ app.get("/api/playlist/:playlistId/tracks", requireApiKey, async (req, res) => {
     const userId = req.userId || req.query.userId || "guest";
     if (!normalizedPlaylistId) return res.status(400).json({ error: "Missing playlistId" });
 
-    let tracks = [];
     if (normalizedPlaylistId.startsWith("RD")) {
       const seedVideoId = normalizedPlaylistId.slice(2);
       const radioQueue = seedVideoId ? await innertube.getRadioQueue(seedVideoId, userId) : null;
-      tracks = radioQueue ? innertube.parsePlaylistPanel(radioQueue) : [];
-    } else {
-      tracks = await innertube.getPlaylistTracks(normalizedPlaylistId, userId);
-      if (!tracks.length && !normalizedPlaylistId.startsWith("PL")) {
-        tracks = await spotify.getPlaylist(normalizedPlaylistId);
-      }
+      const tracks = radioQueue ? innertube.parsePlaylistPanel(radioQueue) : [];
+      const artworkUrl = tracks.length ? tracks[0]?.artworkUrl : null;
+      const title = `Radio • ${tracks[0]?.artist || ""}`;
+      return res.json({ id: normalizedPlaylistId, title, description: "", artworkUrl, tracks });
     }
-    
-    res.json({ id: normalizedPlaylistId, tracks });
+    const result = await innertube.getPlaylistTracks(normalizedPlaylistId, userId);
+    if (!result.tracks.length && !normalizedPlaylistId.startsWith("PL")) {
+      result.tracks = await spotify.getPlaylist(normalizedPlaylistId);
+    }
+    res.json(result);
   } catch (err) {
     console.error("[playlist/tracks] Error:", err.message);
     res.status(500).json({ error: err.message });
@@ -2220,7 +2230,8 @@ app.get("/api/radio/:seedVideoId/tracks", requireApiKey, async (req, res) => {
 
     const radioQueue = await innertube.getRadioQueue(seedVideoId, userId);
     const tracks = radioQueue ? innertube.parsePlaylistPanel(radioQueue) : [];
-    res.json({ id: `RD${seedVideoId}`, seedVideoId, tracks });
+    const artworkUrl = tracks.length ? tracks[0]?.artworkUrl : null;
+    res.json({ id: `RD${seedVideoId}`, seedVideoId, title: `Radio • ${tracks[0]?.artist || ""}`, description: "", artworkUrl, tracks });
   } catch (err) {
     console.error("[radio/tracks] Error:", err.message);
     res.status(500).json({ error: err.message });
