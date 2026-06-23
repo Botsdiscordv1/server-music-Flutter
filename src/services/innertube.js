@@ -1775,7 +1775,20 @@ async function getHomeFeed(userId, params = null) {
     const cookiePreview = usingCookies ? usingCookies.substring(0, 40) + "..." : "none";
     const isPerUser = userId && userCookiesMap.has(userId);
     console.log(`[InnerTube] getHomeFeed userId=${userId} cookieLen=${usingCookies ? usingCookies.length : 0} perUserCookies=${isPerUser} globalCookies=${!!userCookieString} preview=${cookiePreview}`);
-    const data = await apiRequestWithBrowseFallback({ browseId: "FEmusic_home", params: params || undefined }, {}, userId);
+    const hasUserCookies = userId && userCookiesMap.has(userId);
+    const data = hasUserCookies
+      ? await (async () => {
+          try {
+            return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true);
+          } catch (err) {
+            if (err?.response?.status === 500) {
+              console.warn("[InnerTube] getHomeFeed with auth failed (500), retrying without auth");
+              return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, false);
+            }
+            throw err;
+          }
+        })()
+      : await apiRequestWithBrowseFallback({ browseId: "FEmusic_home", params: params || undefined }, {}, userId);
     if (data) {
       homeFeedCache.set(cacheKey, { data, ts: Date.now() });
     }
