@@ -647,14 +647,14 @@ async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clien
 }
 
 async function apiRequestWithBrowseFallback(data, query, userId) {
+  // WEB_REMIX no necesita auth para browse. Intentar sin auth primero evita 500 por dataSyncId.
   try {
-    return await apiRequest("browse", data, query, userId, true);
+    return await apiRequest("browse", data, query, userId, false);
   } catch (err) {
     const status = err?.response?.status;
-    const reason = err?.response?.data?.error?.errors?.[0]?.reason || err?.response?.data?.error?.status;
-    if (status === 500 && reason === "backendError") {
-      console.warn("[InnerTube] browse backendError, retrying without delegate context");
-      return await apiRequest("browse", data, query, userId, false);
+    if (status === 500) {
+      console.warn("[InnerTube] browse failed without auth, retrying with auth");
+      return await apiRequest("browse", data, query, userId, true);
     }
     throw err;
   }
@@ -1853,7 +1853,7 @@ async function getRadioQueue(videoId, userId) {
     return await apiRequest("next", {
       videoId: videoId,
       playlistId: "RD" + videoId
-    }, {}, userId, true, "WEB_REMIX");
+    }, {}, userId, false, "WEB_REMIX");
   } catch (err) {
     console.warn(`[InnerTube] getRadioQueue failed for videoId ${videoId}: ${err.message}`);
     return null;
@@ -2128,27 +2128,26 @@ async function getAlbumTracks(albumId, userId, initialData = null) {
       return [];
     };
 
-    // Paso 1: Intentar con el ID normalizado (MPREb_...) usando ANDROID_MUSIC + WEB_REMIX en paralelo
-    let tracks = await raceClients(true, normalizedId);
+    // Paso 1: Sin auth primero (evita 500 por dataSyncId)
+    let tracks = await raceClients(false, normalizedId);
     if (!tracks.length) {
-      console.warn(`[InnerTube] getAlbumTracks empty with auth for ${normalizedId}, retrying without auth`);
-      tracks = await raceClients(false, normalizedId);
+      tracks = await raceClients(true, normalizedId);
     }
     if (tracks.length) return tracks;
 
-    // Paso 2: ANDROID_MUSIC no trae microformat/OLAK. Obtenerlo via WEB_REMIX.
+    // Paso 2: Obtener OLAK desde WEB_REMIX (sin auth)
     let olakId = initialData ? extractAlbumPlaylistId(initialData) : null;
     if (!olakId) {
-      const webData = await apiRequest("browse", { browseId: normalizedId }, {}, userId, true, "WEB_REMIX").catch(() => null);
+      const webData = await apiRequest("browse", { browseId: normalizedId }, {}, userId, false, "WEB_REMIX").catch(() => null);
       if (webData) olakId = extractAlbumPlaylistId(webData);
     }
 
-    // Paso 3: Si encontramos OLAK, intentar con WEB_REMIX directamente
+    // Paso 3: Si encontramos OLAK, intentar con WEB_REMIX directamente (sin auth primero)
     if (olakId) {
       console.log(`[InnerTube] getAlbumTracks trying OLAK playlist ${olakId} for ${albumId}`);
-      tracks = await fetchTracksWithClient(true, olakId, "WEB_REMIX");
+      tracks = await fetchTracksWithClient(false, olakId, "WEB_REMIX");
       if (!tracks.length) {
-        tracks = await fetchTracksWithClient(false, olakId, "WEB_REMIX");
+        tracks = await fetchTracksWithClient(true, olakId, "WEB_REMIX");
       }
       if (tracks.length) return tracks;
     }
@@ -2189,9 +2188,9 @@ async function getAlbumDetails(albumId, userId) {
 
   const inFlight = (async () => {
     try {
-      let data = await apiRequest("browse", { browseId: albumId }, {}, userId, true, "ANDROID_MUSIC");
+      let data = await apiRequest("browse", { browseId: albumId }, {}, userId, false, "ANDROID_MUSIC");
       if (!data) {
-        data = await apiRequest("browse", { browseId: albumId }, {}, userId, false, "ANDROID_MUSIC");
+        data = await apiRequest("browse", { browseId: albumId }, {}, userId, true, "ANDROID_MUSIC");
       }
       if (!data) return null;
 
