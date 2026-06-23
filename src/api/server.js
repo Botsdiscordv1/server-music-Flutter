@@ -3110,9 +3110,15 @@ app.post("/api/auth/google", async (req, res) => {
 
     if (!idToken) return res.status(400).json({ error: "idToken is required" });
 
-    console.log(`[Google Auth] idToken prefix=${idToken.substring(0, 30)}... len=${idToken.length} parts=${idToken.split(".").length}`);
+    // Decodificar payload sin verificar para debug
+    try {
+      const b64 = idToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      const payload = JSON.parse(Buffer.from(b64, "base64").toString());
+      console.log(`[Google Auth] token aud=${payload.aud} iss=${payload.iss} sub=${payload.sub} email=${payload.email}`);
+    } catch (e) {
+      console.warn(`[Google Auth] failed to decode token: ${e.message}`);
+    }
 
-    // Verificar token con Google API
     const googleRes = await axios.get(`https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`, {
       timeout: 10000,
       validateStatus: () => true,
