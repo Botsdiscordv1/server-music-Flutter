@@ -571,6 +571,8 @@ function buildHeaders(cookieString, userId, includeAuth, clientOverride) {
       const sapisidHash = generateSapisidHash(effective, YTM_BASE);
       if (sapisidHash) {
         h["Authorization"] = `SAPISIDHASH ${sapisidHash}`;
+      } else {
+        console.warn("[InnerTube] SAPISID hash generation failed - no SAPISID/APISID cookie found");
       }
       // X-Goog-Delegate-To: sesion ID para autenticacion delegada
       const dataSyncId = resolveDataSyncId(userId);
@@ -1782,8 +1784,22 @@ async function getHomeFeed(userId, params = null) {
             return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true);
           } catch (err) {
             if (err?.response?.status === 500) {
-              console.warn("[InnerTube] getHomeFeed with auth failed (500), retrying without auth");
-              return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, false);
+              console.warn("[InnerTube] getHomeFeed with auth failed (500), re-extracting dataSyncId and retrying with auth");
+              userDataSyncIdMap.delete(userId);
+              const cookieStr = resolveCookieString(userId);
+              if (cookieStr) {
+                const dsId = await extractDataSyncId(cookieStr);
+                if (dsId) userDataSyncIdMap.set(userId, dsId);
+              }
+              try {
+                return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true);
+              } catch (retryErr) {
+                if (retryErr?.response?.status === 500 || retryErr?.response?.status === 400) {
+                  console.warn("[InnerTube] getHomeFeed with auth still failed, falling back to no auth");
+                  return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, false);
+                }
+                throw retryErr;
+              }
             }
             throw err;
           }
