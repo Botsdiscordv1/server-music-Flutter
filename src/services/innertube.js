@@ -1517,44 +1517,40 @@ async function getPlayer(videoId, options = {}) {
   const isLoggedIn = !!(resolveCookieString(options.userId));
   let lastError = null;
 
-  // Lanzar todos los clientes en paralelo, tomar el primero que responda con streamingData
+  // Secuencial: ANDROID_VR primero (más rápido, omite cifrado), luego fallbacks
   const clients = [...new Set(PLAYER_STREAM_CLIENTS)].filter(clientName => {
     if (isStreamClientBlocked(videoId, clientName)) return false;
     if (!isLoggedIn && PLAYER_LOGGED_IN_FILTER.has(clientName)) return false;
     return true;
   });
 
-  const results = await Promise.allSettled(clients.map(async (clientName) => {
-    const body = {
-      videoId,
-      playbackContext: {
-        contentPlaybackContext: { signatureTimestamp },
-      },
-      serviceIntegrityDimensions: { poToken: localPoToken },
-      thirdPartyUploadUrlSupport: false,
-    };
+  for (const clientName of clients) {
     try {
+      const body = {
+        videoId,
+        playbackContext: {
+          contentPlaybackContext: { signatureTimestamp },
+        },
+        serviceIntegrityDimensions: { poToken: localPoToken },
+        thirdPartyUploadUrlSupport: false,
+      };
       const data = await apiRequest("player", body, {}, options.userId, true, clientName);
-      if (data?.streamingData) return { clientName, data };
-      if (data?.playabilityStatus?.status !== "OK") {
-        throw new Error(data?.playabilityStatus?.reason || "playability not OK");
+      if (data?.streamingData) {
+        const expiresInSeconds = data.streamingData?.expiresInSeconds || 21600;
+        playerCache.set(cacheKey, { data, ts: Date.now(), expiresInSeconds, expiresAt: Date.now() + (expiresInSeconds * 1000) });
+        return data;
       }
-      throw new Error("No streaming data");
+      if (data?.playabilityStatus?.status !== "OK") {
+        lastError = new Error(data?.playabilityStatus?.reason || "playability not OK");
+        continue;
+      }
     } catch (err) {
+      lastError = err;
       if (err?.response?.status === 403) markStreamClientFailed(videoId, clientName);
-      throw err;
-    }
-  }));
-
-  for (const r of results) {
-    if (r.status === "fulfilled" && r.value.data?.streamingData) {
-      const { data, clientName } = r.value;
-      const expiresInSeconds = data.streamingData?.expiresInSeconds || 21600;
-      playerCache.set(cacheKey, { data, ts: Date.now(), expiresInSeconds, expiresAt: Date.now() + (expiresInSeconds * 1000) });
-      return data;
-    }
-    if (r.status === "rejected") {
-      lastError = r.reason;
+      if (err?.response?.status === 400 && err?.response?.data?.error?.message?.includes?.("INVALID_ARGUMENT")) {
+        // retry without dataSyncId handled inside apiRequest
+      }
+      continue;
     }
   }
 
