@@ -3118,10 +3118,12 @@ app.post("/api/auth/google", async (req, res) => {
     } catch (e) {
       return res.status(401).json({ error: "Invalid token format" });
     }
+    console.log(`[Google Auth] Decoded token: aud=${payload.aud} iss=${payload.iss} sub=${payload.sub} exp=${payload.exp} iat=${payload.iat} email=${payload.email} now=${Math.floor(Date.now()/1000)}`);
     if (payload.aud !== process.env.GOOGLE_CLIENT_ID) {
       return res.status(401).json({ error: "Token audience mismatch" });
     }
     if (payload.exp && Date.now() >= payload.exp * 1000) {
+      console.log(`[Google Auth] Token expired: exp=${payload.exp} now=${Math.floor(Date.now()/1000)} diff=${Math.floor(Date.now()/1000 - payload.exp)}s aud=${payload.aud} iss=${payload.iss}`);
       return res.status(401).json({ error: "Token expired" });
     }
     if (!payload.sub) {
