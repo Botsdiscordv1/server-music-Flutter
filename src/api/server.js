@@ -3226,10 +3226,11 @@ app.get("/api/ytm/validate", requireApiKey, async (req, res) => {
     const cookieStr = innertube.resolveCookieString(userId);
     if (!cookieStr) return res.json({ valid: false, reason: "no_cookies" });
 
-    await innertube.apiRequest("browse", { browseId: "FEmusic_home" }, {}, userId, true);
+    // Validar sin auth (evita 400/500 por dataSyncId). WEB_REMIX funciona igual.
+    await innertube.apiRequest("browse", { browseId: "FEmusic_home" }, {}, userId, false);
     res.json({ valid: true });
   } catch (err) {
-    if (err.response?.status === 401 || err.response?.status === 403) {
+    if (err.response?.status === 401 || err.response?.status === 403 || err.response?.status === 400) {
       return res.json({ valid: false, reason: "expired" });
     }
     console.error("[YTM Validate] Error:", err.message);
