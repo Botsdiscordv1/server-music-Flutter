@@ -8,6 +8,8 @@ lavalink/cache/
 data.db
 cookies.txt
 stream-cache.json
+artistImage/cache.json
+artistImage/
 .ytdlp-cache/
 
 Firefox Installer.exe

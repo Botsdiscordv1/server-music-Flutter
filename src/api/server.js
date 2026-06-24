@@ -663,8 +663,10 @@ const ARTIST_INFO_CACHE_TTL = 60 * 60 * 1000;  // 1 hora
 const ARTIST_INFO_CACHE_MAX = 200;
 const artistInfoInFlight = new Map();
 const artistImageCache = new Map();
-const ARTIST_IMAGE_CACHE_TTL = 60 * 60 * 1000;
+const ARTIST_IMAGE_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 días
+const ARTIST_IMAGE_CACHE_MAX = 1000;
 const artistImageInFlight = new Map();
+
 const suggestionsInFlight = new Map();
 const metadataPoolCache = new Map();
 const METADATA_POOL_CACHE_TTL = 2 * 60 * 1000;
@@ -731,6 +733,35 @@ async function withInFlight(map, key, task) {
 }
 setInterval(() => cleanCache(searchCache, SEARCH_CACHE_TTL, SEARCH_CACHE_MAX), 60_000);
 setInterval(() => cleanCache(artistInfoCache, ARTIST_INFO_CACHE_TTL, ARTIST_INFO_CACHE_MAX), 60_000);
+setInterval(() => cleanCache(artistImageCache, ARTIST_IMAGE_CACHE_TTL, ARTIST_IMAGE_CACHE_MAX), 60_000);
+
+const ARTIST_IMAGE_RETRY_INTERVAL = 6 * 60 * 60 * 1000; // 6 horas
+
+async function retryIncompleteArtistImages() {
+  try {
+    const incomplete = await db.getIncompleteArtistImages();
+    if (!incomplete.length) return;
+    console.log(`[ArtistImage] Re-resolviendo ${incomplete.length} artistas con browseId faltante...`);
+    let resolved = 0;
+    await Promise.allSettled(incomplete.map(async (entry) => {
+      try {
+        const browseId = await innertube.searchArtistBrowseId(entry.artistName);
+        if (!browseId) return;
+        const imageUrl = await innertube.getArtistImageFromBrowse(browseId);
+        if (!imageUrl) return;
+        await db.setArtistImage(entry.artistName, imageUrl, browseId);
+        artistImageCache.set(entry.artistName, { data: { url: imageUrl }, ts: Date.now() });
+        resolved++;
+      } catch {}
+    }));
+    if (resolved > 0) console.log(`[ArtistImage] Completados ${resolved}/${incomplete.length} artistas con InnerTube`);
+  } catch (err) {
+    console.warn(`[ArtistImage] Error en retryIncompleteArtistImages: ${err.message}`);
+  }
+}
+
+setInterval(retryIncompleteArtistImages, ARTIST_IMAGE_RETRY_INTERVAL);
+setTimeout(retryIncompleteArtistImages, 60_000); // primer intento a los 60s del inicio
 
 function extractVideoId(input) {
   if (!input) return null;
@@ -1110,6 +1141,7 @@ app.get("/api/search", requireApiKey, async (req, res) => {
       if (!tracks.length) return { query: q, source, tracks: [], continuation: null };
 
       tracks = await enrichArtworkWithDeezer(tracks);
+      tracks = await enrichTracksWithArtistImages(tracks, userId);
       tracks = rankSearchResults(q, tracks);
 
       const payload = { query: q, source, tracks, continuation: source === "ytmsearch" ? continuation : null };
@@ -1149,6 +1181,7 @@ app.get("/api/search/continuation", requireApiKey, async (req, res) => {
     const result = await innertube.searchContinuationDetailed(continuation);
     let tracks = result.items || [];
     tracks = await enrichArtworkWithDeezer(tracks);
+    tracks = await enrichTracksWithArtistImages(tracks, userId);
 
     const payload = { query: q, source, tracks, continuation: result.continuation || null };
     res.json(payload);
@@ -1345,6 +1378,106 @@ async function enrichArtworkWithDeezer(tracks) {
   });
   await Promise.allSettled(lookups);
   return enriched;
+}
+
+async function enrichTracksWithArtistImages(tracks, userId) {
+  if (!tracks?.length) return tracks;
+
+  const getArtistName = (track) => track.artist || track.author || track.track_author || track.trackAuthor || "";
+
+  const artistMap = new Map();
+  for (const track of tracks) {
+    const artistName = getArtistName(track);
+    if (!artistName) continue;
+    const key = artistName.toLowerCase().trim();
+    if (!artistMap.has(key)) {
+      artistMap.set(key, { name: artistName, browseId: track.artistBrowseId || null });
+    } else if (!artistMap.get(key).browseId && track.artistBrowseId) {
+      artistMap.get(key).browseId = track.artistBrowseId;
+    }
+  }
+
+  const searchPromises = [];
+  for (const [, entry] of artistMap) {
+    if (!entry.browseId) {
+      searchPromises.push((async () => {
+        const browseId = await innertube.searchArtistBrowseId(entry.name, userId);
+        if (browseId) entry.browseId = browseId;
+      })());
+    }
+  }
+  await Promise.allSettled(searchPromises);
+
+  const fetchPromises = [];
+  const dbLookupKeys = [];
+
+  for (const [key, entry] of artistMap) {
+    if (entry.imageResolved) continue;
+    entry.imageResolved = true;
+    const cached = artistImageCache.get(key);
+    if (cached && Date.now() - cached.ts < ARTIST_IMAGE_CACHE_TTL) {
+      entry.imageUrl = cached.data.url;
+      continue;
+    }
+    dbLookupKeys.push({ key, entry });
+  }
+
+  // Batch lookup desde MongoDB
+  if (dbLookupKeys.length > 0) {
+    try {
+      const allDbImages = await db.getAllArtistImages();
+      const dbMap = new Map();
+      for (const img of allDbImages) {
+        if (img.imageUrl) dbMap.set(img.artistName, img.imageUrl);
+      }
+
+      for (const { key, entry } of dbLookupKeys) {
+        const dbUrl = dbMap.get(key);
+        if (dbUrl) {
+          entry.imageUrl = dbUrl;
+          artistImageCache.set(key, { data: { url: dbUrl }, ts: Date.now() });
+        } else {
+          fetchPromises.push(resolveArtistImage(key, entry, userId));
+        }
+      }
+    } catch {
+      for (const { key, entry } of dbLookupKeys) {
+        fetchPromises.push(resolveArtistImage(key, entry, userId));
+      }
+    }
+  }
+
+  await Promise.allSettled(fetchPromises);
+
+  for (const track of tracks) {
+    const artistName = getArtistName(track);
+    if (!artistName) continue;
+    const key = artistName.toLowerCase().trim();
+    const entry = artistMap.get(key);
+    if (entry?.imageUrl) {
+      track.artistImageUrl = entry.imageUrl;
+    }
+  }
+
+  return tracks;
+}
+
+async function resolveArtistImage(key, entry, userId) {
+  let imageUrl = null;
+  if (entry.browseId) {
+    imageUrl = await innertube.getArtistImageFromBrowse(entry.browseId, userId);
+  }
+  if (!imageUrl) {
+    try {
+      const info = await spotify.searchArtistDeezer(entry.name);
+      imageUrl = info?.image || null;
+    } catch {}
+  }
+  entry.imageUrl = imageUrl;
+  artistImageCache.set(key, { data: { url: imageUrl }, ts: Date.now() });
+  if (imageUrl) {
+    db.setArtistImage(key, imageUrl, entry.browseId || null).catch(() => {});
+  }
 }
 
 // ── Video Search (YouTube) ────────────────────────────────────────────
@@ -1885,7 +2018,8 @@ app.get("/api/likes/:userId", requireApiKey, async (req, res) => {
     const userId = req.userId || req.params.userId;
     const connSource = req.provider || "android";
     const contentType = req.query.type === "video" ? "VIDEO" : req.query.type === "audio" ? "AUDIO" : null;
-    const songs = await db.getLikedSongs(userId, parseInt(req.query.limit) || 0, connSource, contentType);
+    let songs = await db.getLikedSongs(userId, parseInt(req.query.limit) || 0, connSource, contentType);
+    songs = await enrichTracksWithArtistImages(songs, userId);
     res.json({ count: songs.length, songs });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2206,7 +2340,8 @@ app.get("/api/playlist/:playlistId/tracks", requireApiKey, async (req, res) => {
     if (normalizedPlaylistId.startsWith("RD")) {
       const seedVideoId = normalizedPlaylistId.slice(2);
       const radioQueue = seedVideoId ? await innertube.getRadioQueue(seedVideoId, userId) : null;
-      const tracks = radioQueue ? innertube.parsePlaylistPanel(radioQueue) : [];
+      let tracks = radioQueue ? innertube.parsePlaylistPanel(radioQueue) : [];
+      tracks = await enrichTracksWithArtistImages(tracks, userId);
       const artworkUrl = tracks.length ? tracks[0]?.artworkUrl : null;
       const title = `Radio • ${tracks[0]?.artist || ""}`;
       return res.json({ id: normalizedPlaylistId, title, description: "", artworkUrl, tracks });
@@ -2215,6 +2350,7 @@ app.get("/api/playlist/:playlistId/tracks", requireApiKey, async (req, res) => {
     if (!result.tracks.length && !normalizedPlaylistId.startsWith("PL")) {
       result.tracks = await spotify.getPlaylist(normalizedPlaylistId);
     }
+    result.tracks = await enrichTracksWithArtistImages(result.tracks, userId);
     res.json(result);
   } catch (err) {
     console.error("[playlist/tracks] Error:", err.message);
@@ -2229,7 +2365,8 @@ app.get("/api/radio/:seedVideoId/tracks", requireApiKey, async (req, res) => {
     if (!seedVideoId) return res.status(400).json({ error: "Missing seedVideoId" });
 
     const radioQueue = await innertube.getRadioQueue(seedVideoId, userId);
-    const tracks = radioQueue ? innertube.parsePlaylistPanel(radioQueue) : [];
+    let tracks = radioQueue ? innertube.parsePlaylistPanel(radioQueue) : [];
+    tracks = await enrichTracksWithArtistImages(tracks, userId);
     const artworkUrl = tracks.length ? tracks[0]?.artworkUrl : null;
     res.json({ id: `RD${seedVideoId}`, seedVideoId, title: `Radio • ${tracks[0]?.artist || ""}`, description: "", artworkUrl, tracks });
   } catch (err) {
@@ -2307,6 +2444,7 @@ app.get("/api/album/:albumId", requireApiKey, async (req, res) => {
       if (!albumArtist) {
         albumArtist = await resolveAlbumArtistFallback(result.title || result.albumName || ytDlpAlbum?.title || "", tracks, ytDlpAlbum);
       }
+      tracks = await enrichTracksWithArtistImages(tracks, userId);
       const payload = buildAlbumPayload(albumId, result, tracks, ytDlpAlbum, albumArtist);
       const firstTrack = payload.tracks?.[0];
       console.log(
@@ -2348,8 +2486,38 @@ app.post("/api/artist/images", requireApiKey, async (req, res) => {
     const result = {};
     await Promise.all(names.map(async (name) => {
       try {
-        const info = await spotify.searchArtistDeezer(name);
-        result[name] = info?.image || null;
+        const cacheKey = name.trim().toLowerCase();
+        let imageUrl = null;
+
+        // Intentar desde MongoDB
+        try {
+          const dbImg = await db.getArtistImage(cacheKey);
+          if (dbImg?.imageUrl) imageUrl = dbImg.imageUrl;
+        } catch {}
+
+        if (!imageUrl) {
+          // InnerTube como fuente principal
+          try {
+            const browseId = await innertube.searchArtistBrowseId(name);
+            if (browseId) {
+              imageUrl = await innertube.getArtistImageFromBrowse(browseId);
+            }
+          } catch {}
+        }
+
+        if (!imageUrl) {
+          // Deezer como fallback
+          try {
+            const info = await spotify.searchArtistDeezer(name);
+            imageUrl = info?.image || null;
+          } catch {}
+        }
+
+        result[name] = imageUrl;
+        if (imageUrl) {
+          artistImageCache.set(cacheKey, { data: { url: imageUrl }, ts: Date.now() });
+          db.setArtistImage(cacheKey, imageUrl, null).catch(() => {});
+        }
       } catch { result[name] = null; }
     }));
     res.json(result);
@@ -2374,9 +2542,37 @@ app.get("/api/artist-image", requireApiKey, async (req, res) => {
         return existing.data;
       }
 
-      const info = await spotify.searchArtistDeezer(name);
-      const payload = { url: info?.image || null };
+      let imageUrl = null;
+
+      // Intentar desde MongoDB
+      try {
+        const dbImg = await db.getArtistImage(cacheKey);
+        if (dbImg?.imageUrl) imageUrl = dbImg.imageUrl;
+      } catch {}
+
+      if (!imageUrl) {
+        // InnerTube como fuente principal
+        try {
+          const browseId = await innertube.searchArtistBrowseId(name);
+          if (browseId) {
+            imageUrl = await innertube.getArtistImageFromBrowse(browseId);
+          }
+        } catch {}
+      }
+
+      if (!imageUrl) {
+        // Deezer como fallback
+        try {
+          const info = await spotify.searchArtistDeezer(name);
+          imageUrl = info?.image || null;
+        } catch {}
+      }
+
+      const payload = { url: imageUrl };
       artistImageCache.set(cacheKey, { data: payload, ts: Date.now() });
+      if (imageUrl) {
+        db.setArtistImage(cacheKey, imageUrl, null).catch(() => {});
+      }
       return payload;
     });
 

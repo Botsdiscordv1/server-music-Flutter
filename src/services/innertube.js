@@ -2398,6 +2398,43 @@ async function getArtistPage(browseId, userId) {
   }
 }
 
+async function getArtistImageFromBrowse(browseId, userId) {
+  if (!browseId) return null;
+  try {
+    const data = await apiRequestWithBrowseFallback({ browseId }, {}, userId);
+    if (!data) return null;
+    const header = findDeep(data, node => node?.musicImmersiveHeaderRenderer || node?.musicVisualHeaderRenderer || node?.musicDetailHeaderRenderer || node?.musicResponsiveHeaderRenderer);
+    const immersiveRenderer = header?.musicImmersiveHeaderRenderer;
+    const visualRenderer = header?.musicVisualHeaderRenderer;
+    const detailRenderer = header?.musicDetailHeaderRenderer || header?.musicResponsiveHeaderRenderer;
+    const thumbnail = immersiveRenderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
+                      visualRenderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
+                      detailRenderer?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails ||
+                      [];
+    return cleanThumbnail(thumbnail);
+  } catch (err) {
+    console.warn(`[InnerTube] getArtistImageFromBrowse failed for ${browseId}: ${err.message}`);
+    return null;
+  }
+}
+
+async function searchArtistBrowseId(artistName, userId) {
+  if (!artistName) return null;
+  try {
+    const results = await searchQuery(artistName, "artist", userId);
+    if (!results?.length) return null;
+    for (const item of results) {
+      if (item.browseId && item.pageType === "MUSIC_PAGE_TYPE_ARTIST") {
+        return item.browseId;
+      }
+    }
+    return results[0]?.browseId || null;
+  } catch (err) {
+    console.warn(`[InnerTube] searchArtistBrowseId failed for "${artistName}": ${err.message}`);
+    return null;
+  }
+}
+
 // ── Video Real Detection ───────────────────────────────────────────────
 
 function isRealVideo(watchEndpoint) {
@@ -2619,6 +2656,8 @@ module.exports = {
   onSessionChange,
   getSearchSuggestions,
   getArtistPage,
+  getArtistImageFromBrowse,
+  searchArtistBrowseId,
   isRealVideo,
   extractBrowseIdFromMenu,
   getRelatedSections,
