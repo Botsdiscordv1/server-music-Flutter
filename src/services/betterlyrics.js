@@ -133,8 +133,6 @@ async function fetchLyrics(endpoint, params) {
 }
 
 async function getLyrics(trackName, artistName, albumName = "") {
-  if (!API_KEY) return null;
-
   const cleanTitle = (trackName || "").trim();
   const cleanArtist = (artistName || "").trim();
   const cleanAlbum = (albumName || "").trim();
