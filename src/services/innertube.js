@@ -209,6 +209,7 @@ const PLAYER_STREAM_CLIENTS = [
   "IOS_MUSIC",
   "MOBILE",
   "TVHTML5",
+  "WEB_REMIX",
 ];
 
 const PLAYER_LOGGED_IN_FILTER = new Set(["ANDROID_MUSIC", "IOS_MUSIC", "TVHTML5", "MOBILE"]);
@@ -594,19 +595,17 @@ function buildHeaders(cookieString, userId, includeAuth, clientOverride) {
     "X-YouTube-Client-Version": clientConfig.clientVersion,
     "X-Goog-Visitor-Id": resolveVisitorData(userId) || "",
   };
-  if (includeAuth) {
-    const effective = cookieString || userCookieString;
-    if (effective) {
-      h["Cookie"] = effective;
-      const sapisidHash = generateSapisidHash(effective, YTM_BASE);
-      if (sapisidHash) {
-        h["Authorization"] = `SAPISIDHASH ${sapisidHash}`;
-      } else {
-        console.warn("[InnerTube] SAPISID hash generation failed - no SAPISID/APISID cookie found");
-      }
+    if (includeAuth) {
+      const effective = cookieString || userCookieString;
+      if (effective) {
+        h["Cookie"] = effective;
+        const sapisidHash = generateSapisidHash(effective, YTM_BASE);
+        if (sapisidHash) {
+          h["Authorization"] = `SAPISIDHASH ${sapisidHash}`;
+        }
 
+      }
     }
-  }
   return h;
 }
 
@@ -616,7 +615,7 @@ async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clien
   const endpointClientMap = {
     browse: "WEB_REMIX",
     search: "WEB_REMIX",
-    next: "ANDROID_MUSIC",
+    next: "WEB_REMIX",
     player: "ANDROID_VR",
     music_get_search_suggestions: "WEB_REMIX",
   };
@@ -651,8 +650,8 @@ async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clien
         initPromise = null;
       }
       // Smart retry: 400 (INVALID_ARGUMENT) often caused by stale dataSyncId, retry without auth
-      if (err.response.status === 400 && includeAuth) {
-        console.warn(`[InnerTube] ${endpoint} HTTP 400 (likely stale dataSyncId), retrying without auth`);
+      if (includeAuth && (err.response.status === 400 || err.response.status === 403 || err.response.status === 404)) {
+        console.warn(`[InnerTube] ${endpoint} HTTP ${err.response.status} with auth, retrying without auth`);
         return await apiRequest(endpoint, data, query, userId, false, clientNameOverride);
       }
       if (err.response.status === 500 && !clientNameOverride && effectiveClient === "ANDROID_VR") {
@@ -1545,34 +1544,34 @@ async function getPlayer(videoId, options = {}) {
   const isLoggedIn = !!(resolveCookieString(options.userId));
   let lastError = null;
 
-  // Secuencial: ANDROID_VR primero (más rápido, omite cifrado), luego fallbacks
+  // Carrera: ANDROID_VR primero suele ganar, pero permitimos que otros clientes
+  // se resuelvan en paralelo para reducir el impacto de bans / 403 por IP.
   const clients = [...new Set(PLAYER_STREAM_CLIENTS)].filter(clientName => {
     if (isStreamClientBlocked(videoId, clientName)) return false;
     if (!isLoggedIn && PLAYER_LOGGED_IN_FILTER.has(clientName)) return false;
     return true;
   });
 
-  for (const clientName of clients) {
+  const buildBody = () => ({
+    videoId,
+    playbackContext: {
+      contentPlaybackContext: { signatureTimestamp },
+    },
+    serviceIntegrityDimensions: { poToken: localPoToken },
+    thirdPartyUploadUrlSupport: false,
+  });
+
+  const attemptClient = async (clientName) => {
     try {
-      const body = {
-        videoId,
-        playbackContext: {
-          contentPlaybackContext: { signatureTimestamp },
-        },
-        serviceIntegrityDimensions: { poToken: localPoToken },
-        thirdPartyUploadUrlSupport: false,
-      };
-      const data = await apiRequest("player", body, {}, options.userId, true, clientName);
+      const data = await apiRequest("player", buildBody(), {}, options.userId, true, clientName);
       if (data?.streamingData) {
-        const expiresInSeconds = data.streamingData?.expiresInSeconds || 21600;
-        playerCache.set(cacheKey, { data, ts: Date.now(), expiresInSeconds, expiresAt: Date.now() + (expiresInSeconds * 1000) });
-        return data;
+        return { clientName, data };
       }
       if (data?.playabilityStatus?.status !== "OK") {
         lastError = new Error(data?.playabilityStatus?.reason || "playability not OK");
-        if (data?.playabilityStatus?.reason === "FAILED_PRECONDITION") break;
-        continue;
+        return null;
       }
+      return null;
     } catch (err) {
       lastError = err;
       if (err?.response?.status === 403) markStreamClientFailed(videoId, clientName);
@@ -1580,8 +1579,57 @@ async function getPlayer(videoId, options = {}) {
         // retry without dataSyncId handled inside apiRequest
       }
       const msg = err?.response?.data?.error?.message || "";
-      if (msg.includes("FAILED_PRECONDITION")) break;
-      continue;
+      if (msg.includes("FAILED_PRECONDITION")) {
+        throw err;
+      }
+      return null;
+    }
+  };
+
+  if (clients.length) {
+    const settled = new Set();
+    const winner = await new Promise((resolve) => {
+      let remaining = clients.length;
+      let resolved = false;
+
+      const maybeResolve = (value) => {
+        if (!resolved) {
+          resolved = true;
+          resolve(value);
+        }
+      };
+
+      for (const clientName of clients) {
+        attemptClient(clientName)
+          .then((result) => {
+            if (settled.has(clientName)) return;
+            settled.add(clientName);
+            if (result?.data?.streamingData) {
+              maybeResolve(result);
+              return;
+            }
+            remaining--;
+            if (remaining <= 0) maybeResolve(null);
+          })
+          .catch((err) => {
+            if (settled.has(clientName)) return;
+            settled.add(clientName);
+            remaining--;
+            if (err) lastError = err;
+            if (remaining <= 0) maybeResolve(null);
+          });
+      }
+    });
+
+    if (winner?.data?.streamingData) {
+      const expiresInSeconds = winner.data.streamingData?.expiresInSeconds || 21600;
+      playerCache.set(cacheKey, {
+        data: winner.data,
+        ts: Date.now(),
+        expiresInSeconds,
+        expiresAt: Date.now() + (expiresInSeconds * 1000),
+      });
+      return winner.data;
     }
   }
 
@@ -1929,6 +1977,7 @@ async function getCharts(userId) {
 
 function parsePlaylistPanel(data) {
   const contents =
+    data?.contents?.singleColumnWatchNextResults?.tabs?.[0]?.tabRenderer?.content?.musicQueueRenderer?.content?.playlistPanelRenderer?.contents ||
     data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.musicQueueRenderer?.content?.playlistPanelRenderer?.contents ||
     data?.contents?.singleColumnWatchNextResults?.playlistPanel?.playlistPanelRenderer?.contents ||
     [];
@@ -2246,7 +2295,13 @@ async function getAlbumDetails(albumId, userId) {
 
   const inFlight = (async () => {
     try {
-      let data = await apiRequest("browse", { browseId: albumId }, {}, userId, false, "ANDROID_MUSIC");
+      let data = await apiRequest("browse", { browseId: albumId }, {}, userId, false, "WEB_REMIX");
+      if (!data) {
+        data = await apiRequest("browse", { browseId: albumId }, {}, userId, true, "WEB_REMIX");
+      }
+      if (!data) {
+        data = await apiRequest("browse", { browseId: albumId }, {}, userId, false, "ANDROID_MUSIC");
+      }
       if (!data) {
         data = await apiRequest("browse", { browseId: albumId }, {}, userId, true, "ANDROID_MUSIC");
       }
@@ -2287,7 +2342,7 @@ async function getSearchSuggestions(query, userId) {
   if (!query || query.trim().length === 0) return [];
   try {
     const inputQuery = query.trim();
-    const data = await apiRequest("music/get_search_suggestions", { input: inputQuery }, {}, userId, true, "WEB_REMIX");
+    const data = await apiRequest("music/get_search_suggestions", { input: inputQuery }, {}, userId, false, "WEB_REMIX");
     const contents = data?.contents?.searchSuggestionsSectionRenderer?.contents || [];
     const suggestions = [];
     for (const item of contents) {
@@ -2361,6 +2416,11 @@ async function getArtistPage(browseId, userId) {
     const immersiveRenderer = header?.musicImmersiveHeaderRenderer;
     const visualRenderer = header?.musicVisualHeaderRenderer;
     const detailRenderer = header?.musicDetailHeaderRenderer || header?.musicResponsiveHeaderRenderer;
+    const bio = detailRenderer?.description?.runs?.map(r => r.text).join("") ||
+                detailRenderer?.description?.simpleText ||
+                detailRenderer?.straplineTextOne?.runs?.map(r => r.text).join("") ||
+                detailRenderer?.straplineTextOne?.simpleText ||
+                null;
     const title = immersiveRenderer?.title?.runs?.map(r => r.text).join("") ||
                   visualRenderer?.title?.runs?.map(r => r.text).join("") ||
                   detailRenderer?.title?.runs?.map(r => r.text).join("") ||
@@ -2381,6 +2441,7 @@ async function getArtistPage(browseId, userId) {
     const artistInfo = {
       browseId,
       title,
+      bio,
       artworkUrl: cleanThumbnail(thumbnail),
       subscriberCount,
     };
@@ -2511,7 +2572,10 @@ function parseCarouselSection(carouselRenderer) {
 
 function parseRelatedSections(data) {
   // The /next response has a "Related" tab with sectionListRenderer contents
-  const tabs = data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs || [];
+  const tabs = [
+    ...(data?.contents?.singleColumnWatchNextResults?.tabs || []),
+    ...(data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs || []),
+  ];
   // Find the "Related" tab (usually second tab, but search by title to be safe)
   let relatedTab = null;
   for (const tab of tabs) {
@@ -2546,7 +2610,7 @@ async function getRelatedSections(videoId, userId) {
     const data = await apiRequest("next", {
       videoId: videoId,
       playlistId: "RD" + videoId,
-    }, {}, userId, true, "ANDROID_MUSIC");
+    }, {}, userId, true, "WEB_REMIX");
     if (!data) return [];
     return parseRelatedSections(data);
   } catch (err) {
@@ -2559,10 +2623,26 @@ async function getRelatedSections(videoId, userId) {
 
 function extractLyricsBrowseIdFromNext(data, targetVideoId) {
   if (!data || !targetVideoId) return null;
+
+  const tabs = [
+    ...(data?.contents?.singleColumnWatchNextResults?.tabs || []),
+    ...(data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs || []),
+  ];
+
+  for (const tab of tabs) {
+    const renderer = tab?.tabRenderer;
+    const title = (renderer?.title?.toString() || "").toLowerCase();
+    if (title === "letra" || title === "letras" || title === "lyrics") {
+      const browseId = renderer?.endpoint?.browseEndpoint?.browseId || null;
+      if (browseId) return browseId;
+    }
+  }
+
   const contents =
     data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer?.watchNextTabbedResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.musicQueueRenderer?.content?.playlistPanelRenderer?.contents ||
     data?.contents?.singleColumnWatchNextResults?.playlistPanel?.playlistPanelRenderer?.contents ||
     [];
+
   for (const item of contents) {
     const vr = item?.playlistPanelVideoRenderer;
     if (!vr || vr.videoId !== targetVideoId) continue;
@@ -2613,7 +2693,7 @@ async function getYtmLyrics(videoId, userId) {
     const nextData = await apiRequest("next", {
       videoId,
       playlistId: "RD" + videoId,
-    }, {}, userId, true, "ANDROID_MUSIC");
+    }, {}, userId, true, "WEB_REMIX");
     if (!nextData) return null;
     const browseId = extractLyricsBrowseIdFromNext(nextData, videoId);
     if (!browseId) return null;

@@ -2552,6 +2552,19 @@ app.get("/api/artist/info", requireApiKey, async (req, res) => {
         spotify.searchArtistsDirect(name, 3).catch(() => []),
       ]);
 
+      let innertubeBio = null;
+      if (!description) {
+        try {
+          const browseId = await innertube.searchArtistBrowseId(name, req.userId || req.query.userId || "guest");
+          if (browseId) {
+            const artistPage = await innertube.getArtistPage(browseId, req.userId || req.query.userId || "guest");
+            innertubeBio = artistPage?.artist?.bio || null;
+          }
+        } catch (err) {
+          console.warn(`[artist/info] InnerTube bio fallback failed for "${name}": ${err.message}`);
+        }
+      }
+
       if (!deezerInfo && !description && !spotifyArtists.length) {
         return null;
       }
@@ -2566,8 +2579,8 @@ app.get("/api/artist/info", requireApiKey, async (req, res) => {
         imageXl: deezerInfo?.imageXl || spotifyArtist?.image || null,
         fans: deezerInfo?.fans || spotifyArtist?.followers || 0,
         albums: deezerInfo?.albums || 0,
-        description: description?.description || null,
-        descriptionSource: description?.source || null,
+        description: description?.description || innertubeBio || null,
+        descriptionSource: description?.source || (innertubeBio ? "innertube" : null),
         descriptionUrl: description?.url || null,
         source: "deezer+wikipedia",
       };
