@@ -15,7 +15,6 @@ const {
   getAllLikedSongsWithBadUrls,
   BAD_URI_REGEX,
 } = db;
-const { getLyrics } = require("../services/lrclib");
 const spotify = require("../services/spotify");
 const deezer = require("../services/deezer");
 const innertube = require("../services/innertube");
@@ -1207,16 +1206,7 @@ app.get("/api/search/suggestions", requireApiKey, async (req, res) => {
 // GET /api/lyrics/ytm?videoId=<videoId>
 // Returns: { lyrics, source, credits, footer, syncType } | null
 app.get("/api/lyrics/ytm", requireApiKey, async (req, res) => {
-  try {
-    const { videoId } = req.query;
-    if (!videoId) return res.status(400).json({ error: "Missing 'videoId' parameter" });
-    const userId = req.userId || req.query.userId;
-    const result = await innertube.getYtmLyrics(videoId, userId);
-    res.json(result || { lyrics: null, source: null });
-  } catch (err) {
-    console.error("[lyrics/ytm] Error:", err.message);
-    res.status(500).json({ error: err.message });
-  }
+  return res.status(410).json({ error: "Lyrics endpoint disabled" });
 });
 
 // ── Rich Suggestions (InnerTube) ───────────────────────────────────────
@@ -1737,19 +1727,7 @@ app.post("/api/admin/migrate-liked-urls", requireApiKey, async (req, res) => {
 });
 
 app.get("/api/lyrics", requireApiKey, async (req, res) => {
-  try {
-    const { track, artist, album, source, enabled_providers, romanize_japanese, romanize_korean } = req.query;
-    if (!track) return res.status(400).json({ error: "Missing 'track' parameter" });
-    const result = await getLyrics(track, artist || "", album || "", {
-      source,
-      enabledProviders: enabled_providers,
-      romanizeJapanese: romanize_japanese,
-      romanizeKorean: romanize_korean,
-    });
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  return res.status(410).json({ error: "Lyrics endpoint disabled" });
 });
 
 app.get("/api/canvas/manifest", requireApiKey, async (req, res) => {
