@@ -1,7 +1,6 @@
 const axios = require("axios");
 
 const API_BASE_URL = "https://lyrics-api.boidu.dev/";
-const API_KEY = (process.env.BETTERLYRICS_API_KEY || process.env.LYRICS_API_KEY || "").trim();
 
 const client = axios.create({
   baseURL: API_BASE_URL,
@@ -125,10 +124,7 @@ function parseTtml(ttml) {
 }
 
 async function fetchLyrics(endpoint, params) {
-  const response = await client.get(endpoint, {
-    params,
-    headers: API_KEY ? { "X-API-Key": API_KEY } : undefined,
-  });
+  const response = await client.get(endpoint, { params });
   return decodeLyricsResponse(response.data);
 }
 
