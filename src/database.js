@@ -94,6 +94,8 @@ const followedArtistSchema = new mongoose.Schema({
   artistId: { type: String, required: true },
   artistName: String,
   imageUrl: String,
+  browseId: { type: String, default: null },
+  updatedAt: { type: Date, default: Date.now },
   followedAt: { type: Date, default: Date.now },
 });
 followedArtistSchema.index({ userId: 1, artistId: 1 }, { unique: true });
@@ -119,33 +121,6 @@ dislikedSongSchema.index({ userId: 1, trackKey: 1 }, { unique: true });
 
 function cleanAuthor(author) {
   return (author || "").replace(/\s*-\s*Topic$/i, "").trim();
-}
-
-const artistImageSchema = new mongoose.Schema({
-  artistName: { type: String, required: true, unique: true },
-  imageUrl: { type: String, default: null },
-  browseId: { type: String, default: null },
-  updatedAt: { type: Date, default: Date.now },
-});
-
-function getArtistImage(artistName) {
-  return ArtistImage.findOne({ artistName: artistName.toLowerCase().trim() }).lean();
-}
-
-function setArtistImage(artistName, imageUrl, browseId) {
-  return ArtistImage.findOneAndUpdate(
-    { artistName: artistName.toLowerCase().trim() },
-    { imageUrl, browseId, updatedAt: new Date() },
-    { upsert: true, new: true }
-  ).lean();
-}
-
-function getAllArtistImages() {
-  return ArtistImage.find({}).lean();
-}
-
-function getIncompleteArtistImages() {
-  return ArtistImage.find({ browseId: null }).lean();
 }
 
 // ── Event Tracking ─────────────────────────────────────────────────────────
@@ -193,8 +168,6 @@ const FollowedArtist = mongoose.model("FollowedArtist", followedArtistSchema);
 const MetadataPool = mongoose.model("MetadataPool", metadataPoolSchema);
 const Event = mongoose.model("Event", eventSchema);
 const RulePerformance = mongoose.model("RulePerformance", rulePerformanceSchema);
-const ArtistImage = mongoose.model("ArtistImage", artistImageSchema);
-
 // ── Discord connection (separate DB) ──────────────────────────────────
 const discordUri = process.env.DISCORD_MONGODB_URI;
 const discordConn = discordUri ? mongoose.createConnection(discordUri) : null;
@@ -211,8 +184,6 @@ let DiscordFollowedArtist = null;
 let DiscordMetadataPool = null;
 let DiscordEvent = null;
 let DiscordRulePerformance = null;
-let DiscordArtistImage = null;
-
 if (discordConn) {
   DiscordUser = discordConn.model("User", userSchema);
   DiscordUserStats = discordConn.model("UserStats", userStatsSchema);
@@ -226,7 +197,6 @@ if (discordConn) {
   DiscordMetadataPool = discordConn.model("MetadataPool", metadataPoolSchema);
   DiscordEvent = discordConn.model("Event", eventSchema);
   DiscordRulePerformance = discordConn.model("RulePerformance", rulePerformanceSchema);
-  DiscordArtistImage = discordConn.model("ArtistImage", artistImageSchema);
 }
 
 function getModels(source) {
@@ -647,6 +617,8 @@ async function toggleFollowArtist(userId, artist, source = "android") {
     artistId: artist.artistId,
     artistName: artist.artistName,
     imageUrl: artist.imageUrl,
+    browseId: artist.browseId || null,
+    updatedAt: new Date(),
   });
   return { followed: true };
 }
@@ -690,6 +662,8 @@ async function getFollowedArtists(userId, source = "android") {
     artistId: doc.artistId,
     artistName: doc.artistName,
     imageUrl: doc.imageUrl,
+    browseId: doc.browseId || null,
+    updatedAt: doc.updatedAt,
     followedAt: doc.followedAt,
   }));
 }
@@ -1172,6 +1146,7 @@ async function syncUserData(userId, localData, source = "android") {
           artistId: a.artistId,
           artistName: a.artistName || a.artist_name || "",
           imageUrl: a.imageUrl || a.image_url || "",
+          browseId: a.browseId || null,
         });
         added++;
       } catch {}
@@ -1182,6 +1157,7 @@ async function syncUserData(userId, localData, source = "android") {
       artistId: a.artistId,
       artist_name: a.artistName,
       image_url: a.imageUrl,
+      browse_id: a.browseId || null,
       followed_at: a.followedAt,
     }));
     result.followedArtistsAdded = added;
@@ -1401,10 +1377,6 @@ module.exports = {
   updateLikedSongUrl,
   getAllLikedSongsWithBadUrls,
   BAD_URI_REGEX,
-  getArtistImage,
-  setArtistImage,
-  getAllArtistImages,
-  getIncompleteArtistImages,
   createFingerprint,
   upsertMetadataPool,
   getMetadataPool,

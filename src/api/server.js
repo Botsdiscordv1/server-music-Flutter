@@ -735,34 +735,6 @@ setInterval(() => cleanCache(searchCache, SEARCH_CACHE_TTL, SEARCH_CACHE_MAX), 6
 setInterval(() => cleanCache(artistInfoCache, ARTIST_INFO_CACHE_TTL, ARTIST_INFO_CACHE_MAX), 60_000);
 setInterval(() => cleanCache(artistImageCache, ARTIST_IMAGE_CACHE_TTL, ARTIST_IMAGE_CACHE_MAX), 60_000);
 
-const ARTIST_IMAGE_RETRY_INTERVAL = 6 * 60 * 60 * 1000; // 6 horas
-
-async function retryIncompleteArtistImages() {
-  try {
-    const incomplete = await db.getIncompleteArtistImages();
-    if (!incomplete.length) return;
-    console.log(`[ArtistImage] Re-resolviendo ${incomplete.length} artistas con browseId faltante...`);
-    let resolved = 0;
-    await Promise.allSettled(incomplete.map(async (entry) => {
-      try {
-        const browseId = await innertube.searchArtistBrowseId(entry.artistName);
-        if (!browseId) return;
-        const imageUrl = await innertube.getArtistImageFromBrowse(browseId);
-        if (!imageUrl) return;
-        await db.setArtistImage(entry.artistName, imageUrl, browseId);
-        artistImageCache.set(entry.artistName, { data: { url: imageUrl }, ts: Date.now() });
-        resolved++;
-      } catch {}
-    }));
-    if (resolved > 0) console.log(`[ArtistImage] Completados ${resolved}/${incomplete.length} artistas con InnerTube`);
-  } catch (err) {
-    console.warn(`[ArtistImage] Error en retryIncompleteArtistImages: ${err.message}`);
-  }
-}
-
-setInterval(retryIncompleteArtistImages, ARTIST_IMAGE_RETRY_INTERVAL);
-setTimeout(retryIncompleteArtistImages, 60_000); // primer intento a los 60s del inicio
-
 function extractVideoId(input) {
   if (!input) return null;
   const s = input.trim();
@@ -1409,7 +1381,6 @@ async function enrichTracksWithArtistImages(tracks, userId) {
   await Promise.allSettled(searchPromises);
 
   const fetchPromises = [];
-  const dbLookupKeys = [];
 
   for (const [key, entry] of artistMap) {
     if (entry.imageResolved) continue;
@@ -1419,32 +1390,7 @@ async function enrichTracksWithArtistImages(tracks, userId) {
       entry.imageUrl = cached.data.url;
       continue;
     }
-    dbLookupKeys.push({ key, entry });
-  }
-
-  // Batch lookup desde MongoDB
-  if (dbLookupKeys.length > 0) {
-    try {
-      const allDbImages = await db.getAllArtistImages();
-      const dbMap = new Map();
-      for (const img of allDbImages) {
-        if (img.imageUrl) dbMap.set(img.artistName, img.imageUrl);
-      }
-
-      for (const { key, entry } of dbLookupKeys) {
-        const dbUrl = dbMap.get(key);
-        if (dbUrl) {
-          entry.imageUrl = dbUrl;
-          artistImageCache.set(key, { data: { url: dbUrl }, ts: Date.now() });
-        } else {
-          fetchPromises.push(resolveArtistImage(key, entry, userId));
-        }
-      }
-    } catch {
-      for (const { key, entry } of dbLookupKeys) {
-        fetchPromises.push(resolveArtistImage(key, entry, userId));
-      }
-    }
+    fetchPromises.push(resolveArtistImage(key, entry, userId));
   }
 
   await Promise.allSettled(fetchPromises);
@@ -1475,9 +1421,6 @@ async function resolveArtistImage(key, entry, userId) {
   }
   entry.imageUrl = imageUrl;
   artistImageCache.set(key, { data: { url: imageUrl }, ts: Date.now() });
-  if (imageUrl) {
-    db.setArtistImage(key, imageUrl, entry.browseId || null).catch(() => {});
-  }
 }
 
 // ── Video Search (YouTube) ────────────────────────────────────────────
@@ -2269,10 +2212,10 @@ app.post("/api/artists/follow", requireApiKey, async (req, res) => {
     const userId = req.userId;
     const source = req.provider || "android";
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
-    const { artistId, artistName, imageUrl } = req.body;
+    const { artistId, artistName, imageUrl, browseId } = req.body;
     if (!artistId) return res.status(400).json({ error: "artistId is required" });
     const canonicalArtistId = await resolveCanonicalArtistId(artistId, artistName, userId);
-    const result = await db.toggleFollowArtist(userId, { artistId: canonicalArtistId || artistId, artistName, imageUrl }, source);
+    const result = await db.toggleFollowArtist(userId, { artistId: canonicalArtistId || artistId, artistName, imageUrl, browseId }, source);
     res.json({ ...result, artistId: canonicalArtistId || artistId });
 
     emitLibraryChanged(userId, source, "artist-followed", { artistId: canonicalArtistId || artistId, followed: !!result?.followed });
@@ -2489,21 +2432,20 @@ app.post("/api/artist/images", requireApiKey, async (req, res) => {
         const cacheKey = name.trim().toLowerCase();
         let imageUrl = null;
 
-        // Intentar desde MongoDB
-        try {
-          const dbImg = await db.getArtistImage(cacheKey);
-          if (dbImg?.imageUrl) imageUrl = dbImg.imageUrl;
-        } catch {}
-
-        if (!imageUrl) {
-          // InnerTube como fuente principal
-          try {
-            const browseId = await innertube.searchArtistBrowseId(name);
-            if (browseId) {
-              imageUrl = await innertube.getArtistImageFromBrowse(browseId);
-            }
-          } catch {}
+        // Cache en memoria
+        const cached = artistImageCache.get(cacheKey);
+        if (cached && Date.now() - cached.ts < ARTIST_IMAGE_CACHE_TTL) {
+          result[name] = cached.data.url;
+          return;
         }
+
+        // InnerTube como fuente principal
+        try {
+          const browseId = await innertube.searchArtistBrowseId(name);
+          if (browseId) {
+            imageUrl = await innertube.getArtistImageFromBrowse(browseId);
+          }
+        } catch {}
 
         if (!imageUrl) {
           // Deezer como fallback
@@ -2516,7 +2458,6 @@ app.post("/api/artist/images", requireApiKey, async (req, res) => {
         result[name] = imageUrl;
         if (imageUrl) {
           artistImageCache.set(cacheKey, { data: { url: imageUrl }, ts: Date.now() });
-          db.setArtistImage(cacheKey, imageUrl, null).catch(() => {});
         }
       } catch { result[name] = null; }
     }));
@@ -2544,21 +2485,13 @@ app.get("/api/artist-image", requireApiKey, async (req, res) => {
 
       let imageUrl = null;
 
-      // Intentar desde MongoDB
+      // InnerTube como fuente principal
       try {
-        const dbImg = await db.getArtistImage(cacheKey);
-        if (dbImg?.imageUrl) imageUrl = dbImg.imageUrl;
+        const browseId = await innertube.searchArtistBrowseId(name);
+        if (browseId) {
+          imageUrl = await innertube.getArtistImageFromBrowse(browseId);
+        }
       } catch {}
-
-      if (!imageUrl) {
-        // InnerTube como fuente principal
-        try {
-          const browseId = await innertube.searchArtistBrowseId(name);
-          if (browseId) {
-            imageUrl = await innertube.getArtistImageFromBrowse(browseId);
-          }
-        } catch {}
-      }
 
       if (!imageUrl) {
         // Deezer como fallback
@@ -2570,9 +2503,6 @@ app.get("/api/artist-image", requireApiKey, async (req, res) => {
 
       const payload = { url: imageUrl };
       artistImageCache.set(cacheKey, { data: payload, ts: Date.now() });
-      if (imageUrl) {
-        db.setArtistImage(cacheKey, imageUrl, null).catch(() => {});
-      }
       return payload;
     });
 
