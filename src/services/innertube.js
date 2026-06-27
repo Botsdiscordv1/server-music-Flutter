@@ -1945,8 +1945,11 @@ function getGuestCookieStatus() {
   return {
     hasCookies: !!guestCookieString,
     length: guestCookieString ? guestCookieString.length : 0,
-    cookieString: guestCookieString || null,
   };
+}
+
+function getGuestCookieString() {
+  return guestCookieString;
 }
 
 async function getLibraryPlaylists(userId) {
@@ -2770,6 +2773,7 @@ module.exports = {
   setGuestCookies,
   clearGuestCookies,
   getGuestCookieStatus,
+  getGuestCookieString,
   clearHomeFeedCache,
   getLibraryPlaylists,
   getAlbumTracks,

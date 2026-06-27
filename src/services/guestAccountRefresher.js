@@ -141,8 +141,7 @@ async function refreshGuestCookies() {
     return false;
   }
 
-  const current = innertube.getGuestCookieStatus();
-  const hadGoodCookies = hasRealSapisid(current.cookieString);
+  const hadGoodCookies = hasRealSapisid(innertube.getGuestCookieString());
 
   let context = null;
   let page = null;
