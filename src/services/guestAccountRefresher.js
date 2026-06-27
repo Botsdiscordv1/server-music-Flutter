@@ -128,6 +128,10 @@ async function doLogin(context, email, password) {
   return page;
 }
 
+function hasRealSapisid(cookieStr) {
+  return cookieStr && cookieStr.length > 600 && /__Secure-3PAPISID|SAPISID/.test(cookieStr);
+}
+
 async function refreshGuestCookies() {
   const email = process.env.GUEST_YTM_EMAIL;
   const password = process.env.GUEST_YTM_PASSWORD;
@@ -136,6 +140,9 @@ async function refreshGuestCookies() {
     console.warn("[GuestRefresher] GUEST_YTM_EMAIL or GUEST_YTM_PASSWORD not set, skipping");
     return false;
   }
+
+  const current = innertube.getGuestCookieStatus();
+  const hadGoodCookies = hasRealSapisid(current.cookieString);
 
   let context = null;
   let page = null;
@@ -154,6 +161,10 @@ async function refreshGuestCookies() {
     const loggedIn = await isProbablyLoggedIn(page);
 
     if (!loggedIn) {
+      if (hadGoodCookies) {
+        console.log("[GuestRefresher] Session expired but keeping existing good cookies, skipping re-login");
+        return true;
+      }
       console.log("[GuestRefresher] Session expired, re-logging in...");
       const loginPage = await doLogin(context, email, password);
       if (loginPage) page = loginPage;
@@ -162,9 +173,22 @@ async function refreshGuestCookies() {
     }
 
     const cookieString = await extractCookieString(page);
-    if (cookieString && cookieString.length > 80) {
+    const isGood = hasRealSapisid(cookieString);
+
+    if (isGood) {
       innertube.setGuestCookies(cookieString);
       console.log(`[GuestRefresher] Cookies refreshed successfully (${cookieString.length} chars)`);
+      return true;
+    }
+
+    if (hadGoodCookies && !isGood) {
+      console.warn(`[GuestRefresher] Extracted cookies (${cookieString?.length || 0}) worse than current, keeping existing`);
+      return true;
+    }
+
+    if (cookieString && cookieString.length > 80) {
+      innertube.setGuestCookies(cookieString);
+      console.log(`[GuestRefresher] Fallback cookies saved (${cookieString.length} chars)`);
       return true;
     }
 
@@ -172,7 +196,7 @@ async function refreshGuestCookies() {
     return false;
   } catch (err) {
     console.warn(`[GuestRefresher] Refresh failed: ${err.message}`);
-    return false;
+    return hadGoodCookies;
   } finally {
     if (page && !page.isClosed()) await page.close().catch(() => {});
     if (context) await context.close().catch(() => {});

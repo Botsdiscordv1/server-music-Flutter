@@ -1945,6 +1945,7 @@ function getGuestCookieStatus() {
   return {
     hasCookies: !!guestCookieString,
     length: guestCookieString ? guestCookieString.length : 0,
+    cookieString: guestCookieString || null,
   };
 }
 
