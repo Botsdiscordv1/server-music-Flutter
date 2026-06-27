@@ -4,6 +4,7 @@ const http = require("http");
 const https = require("https");
 const querystring = require("querystring");
 const crypto = require("crypto");
+const guestAccountService = require("./guestAccountService");
 
 const KEEP_ALIVE_AGENT = new https.Agent({
   keepAlive: true,
@@ -28,6 +29,7 @@ let initPromise = null;
 let refreshInterval = null;
 let cookieJar = new tough.CookieJar();
 let userCookieString = null;
+let guestCookieString = null;
 let USER_AGENT = USER_AGENT_ANDROID_VR;
 let initFailureUntil = 0;
 let initFailureMessage = null;
@@ -289,6 +291,11 @@ async function initialize() {
         gl: process.env.REGION || ytcfg.GL || "PE",
       };
       await autoObtainGuestCookies();
+      const savedGuest = guestAccountService.loadCookies();
+      if (savedGuest) {
+        guestCookieString = savedGuest;
+        console.log(`[InnerTube] Guest account cookies loaded from storage (${savedGuest.length} chars)`);
+      }
       startRefreshTimer();
       console.log(`[InnerTube] Initialized: client=${config.clientName} v${config.clientVersion}`);
       return config;
@@ -430,11 +437,13 @@ async function scrapeVisitorData(cookieString) {
 
 function resolveDataSyncId(userId) {
   if (userId && userDataSyncIdMap.has(userId)) return userDataSyncIdMap.get(userId);
+  if (userId === "guest" && userDataSyncIdMap.has("__guest__")) return userDataSyncIdMap.get("__guest__");
   return null;
 }
 
 function resolveVisitorData(userId) {
   if (userId && userVisitorDataMap.has(userId)) return userVisitorDataMap.get(userId);
+  if (userId === "guest" && userVisitorDataMap.has("__guest__")) return userVisitorDataMap.get("__guest__");
   if (userVisitorDataMap.has("__global__")) return userVisitorDataMap.get("__global__");
   return config?.visitorData || null;
 }
@@ -595,21 +604,20 @@ function buildHeaders(cookieString, userId, includeAuth, clientOverride) {
     "X-YouTube-Client-Version": clientConfig.clientVersion,
     "X-Goog-Visitor-Id": resolveVisitorData(userId) || "",
   };
-    if (includeAuth) {
-      const effective = cookieString || userCookieString;
-      if (effective) {
-        h["Cookie"] = effective;
-        const sapisidHash = generateSapisidHash(effective, YTM_BASE);
-        if (sapisidHash) {
-          h["Authorization"] = `SAPISIDHASH ${sapisidHash}`;
-        }
-
-      }
+  if (cookieString) {
+    h["Cookie"] = cookieString;
+  }
+  if (includeAuth) {
+    const effective = cookieString || userCookieString;
+    if (effective) {
+      const sapisidHash = generateSapisidHash(effective, YTM_BASE);
+      if (sapisidHash) h["Authorization"] = `SAPISIDHASH ${sapisidHash}`;
     }
+  }
   return h;
 }
 
-async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clientNameOverride) {
+async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clientNameOverride, options = {}) {
   checkRateLimit(endpoint);
   const cfg = await initialize();
   const endpointClientMap = {
@@ -625,11 +633,14 @@ async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clien
   const url = `${YTM_BASE}/youtubei/${cfg.apiVersion}/${endpoint}?${querystring.stringify({ alt: "json", ...query })}`;
   const body = { ...data, context: buildContext(userId, includeAuth, clientOverride) };
   const cookieString = resolveCookieString(userId);
+  const effectiveCookie = options.noGuestCookies
+    ? cookieString || userCookieString
+    : cookieString || (userId === "guest" ? guestCookieString : null) || userCookieString;
   const effectiveClient = clientOverride?.clientName || cfg.clientName;
-  console.log(`[InnerTube] apiRequest endpoint=${endpoint} client=${effectiveClient} cookieLen=${cookieString ? cookieString.length : 0} perUserCookies=${!!(userId && userCookiesMap.has(userId))} includeAuth=${!!includeAuth}`);
+  console.log(`[InnerTube] apiRequest endpoint=${endpoint} client=${effectiveClient} cookieLen=${effectiveCookie ? effectiveCookie.length : 0} perUserCookies=${!!(userId && userCookiesMap.has(userId))} includeAuth=${!!includeAuth}`);
   try {
     const res = await axios.post(url, body, {
-      headers: buildHeaders(cookieString, userId, includeAuth, clientOverride),
+      headers: buildHeaders(effectiveCookie, userId, includeAuth, clientOverride),
       httpsAgent: KEEP_ALIVE_AGENT,
       timeout: 10000,
       responseType: "json",
@@ -652,36 +663,36 @@ async function apiRequest(endpoint, data, query = {}, userId, includeAuth, clien
       // Smart retry: 400 (INVALID_ARGUMENT) often caused by stale dataSyncId, retry without auth
       if (includeAuth && (err.response.status === 400 || err.response.status === 403 || err.response.status === 404)) {
         console.warn(`[InnerTube] ${endpoint} HTTP ${err.response.status} with auth, retrying without auth`);
-        return await apiRequest(endpoint, data, query, userId, false, clientNameOverride);
+        return await apiRequest(endpoint, data, query, userId, false, clientNameOverride, options);
       }
       if (err.response.status === 500 && !clientNameOverride && effectiveClient === "ANDROID_VR") {
         console.warn(`[InnerTube] ANDROID_VR ${endpoint} failed, retrying with ANDROID_MUSIC`);
-        return await apiRequest(endpoint, data, query, userId, includeAuth, "ANDROID_MUSIC");
+        return await apiRequest(endpoint, data, query, userId, includeAuth, "ANDROID_MUSIC", options);
       }
       // IOS_MUSIC fallback for player on 5xx
       if ((err.response.status === 500 || err.response.status === 503) && effectiveClient === "ANDROID_MUSIC" && !clientNameOverride) {
         console.warn(`[InnerTube] ANDROID_MUSIC ${endpoint} failed, retrying with IOS_MUSIC`);
-        return await apiRequest(endpoint, data, query, userId, includeAuth, "IOS_MUSIC");
+        return await apiRequest(endpoint, data, query, userId, includeAuth, "IOS_MUSIC", options);
       }
       // TVHTML5 fallback for player endpoint on 5xx (last resort)
       if ((err.response.status === 500 || err.response.status === 503) && effectiveClient === "IOS_MUSIC") {
         console.warn(`[InnerTube] IOS_MUSIC ${endpoint} failed, retrying with TVHTML5`);
-        return await apiRequest(endpoint, data, query, userId, includeAuth, "TVHTML5");
+        return await apiRequest(endpoint, data, query, userId, includeAuth, "TVHTML5", options);
       }
     }
     throw err;
   }
 }
 
-async function apiRequestWithBrowseFallback(data, query, userId) {
+async function apiRequestWithBrowseFallback(data, query, userId, options = {}) {
   // WEB_REMIX no necesita auth para browse. Intentar sin auth primero evita 500 por dataSyncId.
   try {
-    return await apiRequest("browse", data, query, userId, false);
+    return await apiRequest("browse", data, query, userId, false, undefined, options);
   } catch (err) {
     const status = err?.response?.status;
     if (status === 500) {
       console.warn("[InnerTube] browse failed without auth, retrying with auth");
-      return await apiRequest("browse", data, query, userId, true);
+      return await apiRequest("browse", data, query, userId, true, undefined, options);
     }
     throw err;
   }
@@ -1855,7 +1866,7 @@ async function getHomeFeed(userId, params = null) {
     const data = hasUserCookies
       ? await (async () => {
           try {
-            return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true);
+            return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true, undefined, { noGuestCookies: true });
           } catch (err) {
             if (err?.response?.status === 500) {
               console.warn("[InnerTube] getHomeFeed with auth failed (500), re-extracting dataSyncId and retrying with auth");
@@ -1866,11 +1877,11 @@ async function getHomeFeed(userId, params = null) {
                 if (dsId) userDataSyncIdMap.set(userId, dsId);
               }
               try {
-                return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true);
+                return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true, undefined, { noGuestCookies: true });
               } catch (retryErr) {
                 if (retryErr?.response?.status === 500 || retryErr?.response?.status === 400) {
                   console.warn("[InnerTube] getHomeFeed with auth still failed, falling back to no auth");
-                  return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, false);
+                  return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, false, undefined, { noGuestCookies: true });
                 }
                 throw retryErr;
               }
@@ -1878,7 +1889,7 @@ async function getHomeFeed(userId, params = null) {
             throw err;
           }
         })()
-      : await apiRequestWithBrowseFallback({ browseId: "FEmusic_home", params: params || undefined }, {}, userId);
+      : await apiRequestWithBrowseFallback({ browseId: "FEmusic_home", params: params || undefined }, {}, userId, { noGuestCookies: true });
     if (data) {
       homeFeedCache.set(cacheKey, { data, ts: Date.now() });
     }
@@ -1903,6 +1914,38 @@ function clearHomeFeedCache(userId) {
     }
   }
   else homeFeedCache.clear();
+}
+
+function setGuestCookies(cookieString) {
+  if (!cookieString) return false;
+  const changed = guestCookieString !== cookieString;
+  guestCookieString = cookieString;
+  guestAccountService.saveCookies(cookieString);
+  extractDataSyncId(cookieString).then(dsId => {
+    if (dsId) userDataSyncIdMap.set("__guest__", dsId);
+  });
+  scrapeVisitorData(cookieString).then(vd => {
+    if (vd) userVisitorDataMap.set("__guest__", vd);
+  });
+  if (changed) notifySessionChange("__guest__", cookieString, null);
+  console.log(`[InnerTube] Guest account cookies set (${cookieString.length} chars)`);
+  return true;
+}
+
+function clearGuestCookies() {
+  guestCookieString = null;
+  guestAccountService.clearCookies();
+  userDataSyncIdMap.delete("__guest__");
+  userVisitorDataMap.delete("__guest__");
+  notifySessionChange("__guest__", null, null);
+  console.log("[InnerTube] Guest account cookies cleared");
+}
+
+function getGuestCookieStatus() {
+  return {
+    hasCookies: !!guestCookieString,
+    length: guestCookieString ? guestCookieString.length : 0,
+  };
 }
 
 async function getLibraryPlaylists(userId) {
@@ -2723,6 +2766,9 @@ module.exports = {
   parseMusicItem,
   setCookies,
   removeCookies,
+  setGuestCookies,
+  clearGuestCookies,
+  getGuestCookieStatus,
   clearHomeFeedCache,
   getLibraryPlaylists,
   getAlbumTracks,

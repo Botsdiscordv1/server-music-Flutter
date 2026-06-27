@@ -25,6 +25,7 @@
     "passport-google-oauth20": "^2.0.0",
     "passport-local": "^1.0.0",
     "play-dl": "^1.9.7",
+    "playwright": "^1.61.1",
     "socket.io": "^4.8.3",
     "sql.js": "^1.11.0",
     "youtube-music-api": "^1.0.6"

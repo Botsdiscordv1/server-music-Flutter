@@ -6,6 +6,7 @@ lavalink/Lavalink.jar
 lavalink/logs/
 lavalink/cache/
 data.db
+data/guest-cookies.json
 cookies.txt
 stream-cache.json
 artistImage/cache.json

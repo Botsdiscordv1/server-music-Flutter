@@ -8,6 +8,7 @@ const { initDB } = require("./database");
 const { app: musicApi } = require("./api/server");
 const innertube = require("./services/innertube");
 const canvasCatalogService = require("./services/canvasCatalogService");
+const guestAccountRefresher = require("./services/guestAccountRefresher");
 const { setRealtimeServer } = require("./services/realtime");
 const { attachSocket } = require("./services/deviceSessionService");
 
@@ -176,7 +177,14 @@ async function main() {
     console.warn(`[InnerTube] Startup initialization failed: ${err.message}`);
   });
 
-  // 3. Iniciar Servidor Express
+  // 3. Iniciar refresco automático de cookies para cuenta guest
+  setTimeout(() => {
+    guestAccountRefresher.start().catch(err => {
+      console.warn(`[GuestRefresher] Failed to start: ${err.message}`);
+    });
+  }, 5000);
+
+  // 4. Iniciar Servidor Express
   function startServer(attempt = 1) {
     const serverInstance = http.createServer(musicApi);
     attachRealtime(serverInstance);
