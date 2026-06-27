@@ -1866,7 +1866,7 @@ async function getHomeFeed(userId, params = null) {
     const data = hasUserCookies
       ? await (async () => {
           try {
-            return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true, undefined, { noGuestCookies: true });
+            return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true);
           } catch (err) {
             if (err?.response?.status === 500) {
               console.warn("[InnerTube] getHomeFeed with auth failed (500), re-extracting dataSyncId and retrying with auth");
@@ -1877,11 +1877,11 @@ async function getHomeFeed(userId, params = null) {
                 if (dsId) userDataSyncIdMap.set(userId, dsId);
               }
               try {
-                return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true, undefined, { noGuestCookies: true });
+            return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, true);
               } catch (retryErr) {
                 if (retryErr?.response?.status === 500 || retryErr?.response?.status === 400) {
                   console.warn("[InnerTube] getHomeFeed with auth still failed, falling back to no auth");
-                  return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, false, undefined, { noGuestCookies: true });
+                  return await apiRequest("browse", { browseId: "FEmusic_home", params: params || undefined }, {}, userId, false);
                 }
                 throw retryErr;
               }
@@ -1889,7 +1889,7 @@ async function getHomeFeed(userId, params = null) {
             throw err;
           }
         })()
-      : await apiRequestWithBrowseFallback({ browseId: "FEmusic_home", params: params || undefined }, {}, userId, { noGuestCookies: true });
+      : await apiRequestWithBrowseFallback({ browseId: "FEmusic_home", params: params || undefined }, {}, userId);
     if (data) {
       homeFeedCache.set(cacheKey, { data, ts: Date.now() });
     }

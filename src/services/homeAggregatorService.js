@@ -150,21 +150,38 @@ async function buildPersonalizedFeed(userId, source, context) {
   return sections;
 }
 
+const PERSONALIZED_KEYWORDS = [
+  "para ti", "for you", "quick picks", "listen again", "made for you",
+  "repeat", "mixed", "discovery", "recommended", "recomendado",
+  "relacionado", "related", "because you watched", "similar",
+  "sugerido", "suggested", "you might also like",
+];
+
+function isGenericSection(section) {
+  const lower = (section.title || "").toLowerCase();
+  if (PERSONALIZED_KEYWORDS.some(k => lower.includes(k))) return false;
+  const genericTypes = ["trending", "new_releases", "charts", "popular", "essentials"];
+  if (genericTypes.includes(section.type)) return true;
+  return false;
+}
+
 async function buildColdStart(userId, source) {
   try {
     const recommendationService = require("./recommendationService");
     const recSections = await recommendationService.getRecommendations(userId, source).catch(() => []);
 
-    const sections = recSections.map((ytSec, i) => ({
-      id: `section_yt_${i}`,
-      type: ytSec.type,
-      title: ytSec.title,
-      order: i + 1,
-      items: ytSec.items || [],
-      reason: feedStrategyEngine.REASON_MAP[ytSec.type] || "Recomendado para ti",
-      reasonKeys: ["YouTube Music"],
-      sectionType: ytSec.type,
-    }));
+    const sections = recSections
+      .filter(isGenericSection)
+      .map((ytSec, i) => ({
+        id: `section_yt_${i}`,
+        type: ytSec.type,
+        title: ytSec.title,
+        order: i + 1,
+        items: ytSec.items || [],
+        reason: feedStrategyEngine.REASON_MAP[ytSec.type] || null,
+        reasonKeys: ["YouTube Music"],
+        sectionType: ytSec.type,
+      }));
 
     const relaxIdx = sections.findIndex(s => s.title.toLowerCase().includes("relaj"));
     if (relaxIdx !== -1) {
@@ -177,7 +194,7 @@ async function buildColdStart(userId, source) {
           items: essentialsTracks.slice(0, 15),
           order: relaxIdx + 2,
           reason: "Clásicos que no pasan de moda",
-          reasonKeys: ["Curados para ti"],
+          reasonKeys: ["Destacados"],
           sectionType: "essentials",
         });
         sections.forEach((s, i) => s.order = i + 1);
