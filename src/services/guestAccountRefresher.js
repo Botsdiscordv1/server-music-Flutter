@@ -1,6 +1,7 @@
 const { chromium } = require("playwright");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const innertube = require("./innertube");
 
 const USER_DATA_DIR = path.join(__dirname, "..", "..", "data", "chrome-profile");
@@ -23,10 +24,18 @@ function detectLaunchOptions() {
   if (process.platform === "win32") {
     return { channel: "chrome", headless: true };
   }
-  const bundledPath = path.join(__dirname, "..", "..", "node_modules", "playwright-core", ".local-browsers");
-  if (fs.existsSync(bundledPath)) {
-    return { headless: true };
+
+  const pwPath = path.join(os.homedir(), ".cache", "ms-playwright");
+  if (fs.existsSync(pwPath)) {
+    const entries = fs.readdirSync(pwPath).filter(e => e.startsWith("chromium-") && !e.includes("headless"));
+    if (entries.length) {
+      const fullPath = path.join(pwPath, entries.sort().reverse()[0], "chrome-linux", "chrome");
+      if (fs.existsSync(fullPath)) {
+        return { executablePath: fullPath, headless: true, args: BROWSER_ARGS };
+      }
+    }
   }
+
   try {
     require("child_process").execSync("which google-chrome-stable", { stdio: "ignore" });
     return { channel: "chrome", headless: true, args: BROWSER_ARGS };
@@ -135,7 +144,7 @@ async function refreshGuestCookies() {
     const launchOpts = detectLaunchOptions();
     context = await chromium.launchPersistentContext(USER_DATA_DIR, {
       ...launchOpts,
-      timeout: 30000,
+      timeout: 60000,
     });
 
     page = await context.newPage();
