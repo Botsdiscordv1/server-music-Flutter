@@ -57,7 +57,10 @@ async function extractCookieString(page) {
 function isProbablyLoggedIn(page) {
   return page.evaluate(() => {
     const html = document.documentElement.innerHTML;
-    return html.includes("avatar") || html.includes("PERSONALIZED") || !html.includes("Sign in");
+    const hasAvatar = html.includes('avatar');
+    const hasAccountLink = html.includes('href="/account"') || html.includes('aria-label="Google Account"');
+    const hasSapisidCookie = document.cookie.includes('SAPISID') || document.cookie.includes('__Secure-3PAPISID');
+    return (hasAvatar || hasAccountLink) && hasSapisidCookie;
   }).catch(() => false);
 }
 
