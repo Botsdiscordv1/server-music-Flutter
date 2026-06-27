@@ -208,7 +208,10 @@ async function main() {
 
   server = startServer();
 
+  const canvasEnabled = process.env.CANVAS_ENABLED !== "false";
+
   const syncCanvasCatalog = () => {
+    if (!canvasEnabled) return 0;
     try {
       const synced = canvasCatalogService.syncFilesystemCatalog();
       if (synced.length) {
@@ -221,8 +224,12 @@ async function main() {
     }
   };
 
-  syncCanvasCatalog();
-  rebuildCanvasWatchers(() => scheduleCanvasSync(syncCanvasCatalog));
+  if (canvasEnabled) {
+    syncCanvasCatalog();
+    rebuildCanvasWatchers(() => scheduleCanvasSync(syncCanvasCatalog));
+  } else {
+    console.log("[Canvas] Disabled (CANVAS_ENABLED=false)");
+  }
 
   // 4. TTS Keepalive (Opcional, si está configurado)
   const ttsProvider = (process.env.TTS_PROVIDER || "google").toLowerCase();
