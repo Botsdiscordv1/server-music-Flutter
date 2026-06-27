@@ -1,4 +1,5 @@
 const axios = require("axios");
+const crypto = require("crypto");
 
 const LAVALINK_HOST = process.env.LAVALINK_HOST || "localhost";
 const LAVALINK_PORT = Number(process.env.LAVALINK_PORT) || 2333;
@@ -15,6 +16,17 @@ let spotifyDown = false;
 let spotifyDownChecked = 0;
 let spotifyDisabled = false;
 const SPOTIFY_RETRY_AFTER = 5 * 60 * 1000; // 5 min antes de reintentar
+const SPOTIFY_CLIENT_ID_PUBLIC = "d8a5ed958d274c2e8ee717e6a4b0971d";
+const SPOTIFY_CLIENT_VERSION_FALLBACK = "1.2.94.56.g3bf6a3e0";
+const SPOTIFY_TOTP_SECRET_OBFUSCATED = ',7/*F("rLJ2oxaKL^f+E1xvP@N';
+const SPOTIFY_TOTP_VERSION = 61;
+let spotifyAnonToken = null;
+let spotifyAnonTokenExpiry = 0;
+let spotifyAnonClientVersion = null;
+let spotifyAnonClientVersionAt = 0;
+let spotifyAccessToken = null;
+let spotifyAccessTokenExpiry = 0;
+let spotifyAccessTokenServerTime = null;
 
 async function getSpotifyToken() {
   if (spotifyDisabled && Date.now() - spotifyDownChecked < SPOTIFY_RETRY_AFTER) return null;
@@ -86,6 +98,452 @@ async function searchArtistsDirect(query, limit = 5) {
     spotifyDownChecked = Date.now();
     console.error("[Spotify API] Error:", err.message);
     return [];
+  }
+}
+
+async function searchSpotifyTracks(query, limit = 5) {
+  const data = await spotifyFetch(`/search?q=${encodeURIComponent(query)}&type=track&limit=${Math.min(limit, 50)}`);
+  return (data.tracks?.items || []).map((t) => ({
+    id: t.id,
+    name: t.name,
+    artists: (t.artists || []).map((a) => a.name),
+    album: t.album?.name || null,
+    image: t.album?.images?.[0]?.url || null,
+    uri: t.uri,
+    externalUrl: t.external_urls?.spotify || null,
+    isrc: t.external_ids?.isrc || null,
+  }));
+}
+
+function normalizeSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function decodeDuckDuckGoUrl(href) {
+  const match = String(href || "").match(/[?&]uddg=([^&]+)/i);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+async function searchSpotifyTracksPublic(query, limit = 5) {
+  const q = String(query || "").trim();
+  if (!q) return [];
+
+  const ddg = await axios.get("https://html.duckduckgo.com/html/", {
+    params: { q: `site:open.spotify.com/track ${q}` },
+    timeout: 12000,
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml",
+    },
+  });
+
+  const html = String(ddg.data || "");
+  const items = [];
+  const seen = new Set();
+  const anchorRegex = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = anchorRegex.exec(html)) && items.length < limit * 4) {
+    const url = decodeDuckDuckGoUrl(match[1]);
+    if (!url || !/^https:\/\/open\.spotify\.com\/track\//i.test(url)) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+
+    const title = String(match[2] || "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").trim();
+    const snippetMatch = html.slice(match.index).match(/<a class="result__snippet"[\s\S]*?>([\s\S]*?)<\/a>/i);
+    const snippet = snippetMatch ? String(snippetMatch[1]).replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").trim() : "";
+    items.push({ url, title, snippet });
+  }
+
+  return items
+    .map((item) => {
+      const normalized = normalizeSearchText(`${item.title} ${item.snippet}`);
+      const queryNorm = normalizeSearchText(q);
+      let score = 0;
+      for (const token of queryNorm.split(/\s+/).filter(Boolean)) {
+        if (normalized.includes(token)) score += 1;
+      }
+      if (item.title.toLowerCase().includes(q.toLowerCase())) score += 5;
+      if (item.snippet.toLowerCase().includes(q.toLowerCase())) score += 3;
+      return { ...item, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+async function getSpotifyWebClientVersion() {
+  if (spotifyAnonClientVersion && Date.now() - spotifyAnonClientVersionAt < 24 * 60 * 60 * 1000) {
+    return spotifyAnonClientVersion;
+  }
+
+  try {
+    const res = await axios.get("https://open.spotify.com/search/spotify", {
+      timeout: 10000,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml",
+      },
+    });
+    const html = String(res.data || "");
+    const match = html.match(/<script id="appServerConfig" type="text\/plain">([^<]+)<\/script>/i);
+    if (match) {
+      const decoded = JSON.parse(Buffer.from(match[1], "base64").toString("utf8"));
+      const clientVersion = decoded.clientVersion || decoded.client_version || decoded.buildVersion || null;
+      if (clientVersion) {
+        spotifyAnonClientVersion = clientVersion;
+        spotifyAnonClientVersionAt = Date.now();
+        return clientVersion;
+      }
+    }
+  } catch {}
+
+  spotifyAnonClientVersion = SPOTIFY_CLIENT_VERSION_FALLBACK;
+  spotifyAnonClientVersionAt = Date.now();
+  return spotifyAnonClientVersion;
+}
+
+function getSpotifyDeviceInfo() {
+  const osName = process.platform === "win32" ? "windows"
+    : process.platform === "darwin" ? "macos"
+    : process.platform === "linux" ? "linux" : process.platform;
+  return {
+    deviceBrand: "unknown",
+    deviceModel: "unknown",
+    os: osName,
+    osVersion: require("os").release?.() || "unknown",
+    containerVersion: undefined,
+    deviceID: (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`),
+    deviceType: "computer",
+    platformIdentifier: undefined,
+  };
+}
+
+function decodeSpotifyTotpSecret(obfuscated) {
+  return Buffer.from(
+    Array.from(String(obfuscated || ""), (ch, idx) => ch.charCodeAt(0) ^ ((idx % 33) + 9)).join(""),
+    "utf8"
+  );
+}
+
+function generateSpotifyTotp(timestamp = Date.now(), serverTimeSeconds = null) {
+  const secret = decodeSpotifyTotpSecret(SPOTIFY_TOTP_SECRET_OBFUSCATED);
+  const stepMs = 30 * 1000;
+  const counter = Math.floor(((serverTimeSeconds != null && !Number.isNaN(Number(serverTimeSeconds)) ? Number(serverTimeSeconds) * 1000 : timestamp)) / stepMs);
+  const counterBuf = Buffer.alloc(8);
+  counterBuf.writeBigUInt64BE(BigInt(counter));
+  const hmac = crypto.createHmac("sha1", secret).update(counterBuf).digest();
+  const offset = hmac[hmac.length - 1] & 15;
+  const code = ((hmac.readUInt32BE(offset) & 0x7fffffff) % 1000000).toString().padStart(6, "0");
+  return code;
+}
+
+async function getSpotifyPublicAccessToken() {
+  if (spotifyAccessToken && Date.now() < spotifyAccessTokenExpiry) return spotifyAccessToken;
+
+  const res = await axios.get("https://open.spotify.com/search/spotify", {
+    timeout: 10000,
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml",
+    },
+  });
+  const html = String(res.data || "");
+  const key = '<script id="appServerConfig" type="text/plain">';
+  const start = html.indexOf(key);
+  const end = html.indexOf("</script>", start);
+  const decoded = JSON.parse(Buffer.from(html.slice(start + key.length, end), "base64").toString("utf8"));
+  const serverTime = decoded.serverTime || null;
+  spotifyAccessTokenServerTime = serverTime;
+
+  const params = new URLSearchParams({
+    reason: "init",
+    productType: "web_player",
+    totp: generateSpotifyTotp(Date.now()),
+    totpServer: generateSpotifyTotp(Date.now(), serverTime),
+    totpVer: String(SPOTIFY_TOTP_VERSION),
+  });
+
+  const tokenRes = await axios.get(`https://open.spotify.com/api/token?${params.toString()}`, {
+    timeout: 12000,
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      Accept: "application/json",
+      Referer: "https://open.spotify.com/",
+      Origin: "https://open.spotify.com",
+    },
+  });
+
+  const accessToken = tokenRes.data?.accessToken || tokenRes.data?.access_token || null;
+  const expiresIn = Number(tokenRes.data?.accessTokenExpirationTimestampMs ? (Number(tokenRes.data.accessTokenExpirationTimestampMs) - Date.now()) / 1000 : tokenRes.data?.accessTokenExpiresIn ?? tokenRes.data?.accessTokenExpirationSeconds ?? 3600);
+  if (!accessToken) throw new Error("Spotify public access token not granted");
+  spotifyAccessToken = accessToken;
+  spotifyAccessTokenExpiry = Date.now() + Math.max(60, expiresIn || 3600) * 1000;
+  return spotifyAccessToken;
+}
+
+function getSpotifyPublicAccessTokenMeta() {
+  return {
+    token: spotifyAccessToken,
+    expiry: spotifyAccessTokenExpiry,
+    serverTime: spotifyAccessTokenServerTime,
+  };
+}
+
+async function getSpotifyAnonymousClientToken() {
+  if (spotifyAnonToken && Date.now() < spotifyAnonTokenExpiry) return spotifyAnonToken;
+
+  const clientVersion = await getSpotifyWebClientVersion();
+  const deviceInfo = getSpotifyDeviceInfo();
+  const res = await axios.post(
+    "https://clienttoken.spotify.com/v1/clienttoken",
+    {
+      client_data: {
+        client_version: clientVersion,
+        client_id: SPOTIFY_CLIENT_ID_PUBLIC,
+        js_sdk_data: {
+          device_brand: deviceInfo.deviceBrand,
+          device_model: deviceInfo.deviceModel,
+          os: deviceInfo.os,
+          os_version: deviceInfo.osVersion,
+          container_version: deviceInfo.containerVersion,
+          device_id: deviceInfo.deviceID,
+          device_type: deviceInfo.deviceType,
+          platform_identifier: deviceInfo.platformIdentifier,
+        },
+      },
+    },
+    {
+      timeout: 12000,
+      headers: { "content-type": "application/json", accept: "application/json" },
+    }
+  );
+
+  const granted = res.data?.granted_token;
+  if (!granted?.token) throw new Error("Spotify anonymous token not granted");
+  spotifyAnonToken = granted.token;
+  spotifyAnonTokenExpiry = Date.now() + Math.max(60, Number(granted.refresh_after_seconds) || 300) * 1000;
+  return spotifyAnonToken;
+}
+
+function extractSpotifyTrackUri(candidate) {
+  if (!candidate) return null;
+  const raw = candidate.uri
+    || candidate.linkedUri
+    || candidate.track?.uri
+    || candidate.data?.uri
+    || candidate.item?.data?.uri
+    || candidate.itemV2?.data?.uri
+    || candidate.itemV2?.data?.track?.uri
+    || null;
+  if (typeof raw === "string" && raw.includes("spotify:track:")) return raw;
+  return null;
+}
+
+function normalizeMatchText(value) {
+  return normalizeStr(String(value || ""))
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scoreTextMatch(expected, actual) {
+  const a = normalizeMatchText(expected);
+  const b = normalizeMatchText(actual);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) return 0.9;
+
+  const aWords = a.split(" ").filter(Boolean);
+  const bWords = b.split(" ").filter(Boolean);
+  const setB = new Set(bWords);
+  let hit = 0;
+  for (const word of aWords) if (setB.has(word)) hit += 1;
+  return hit / Math.max(aWords.length, bWords.length, 1);
+}
+
+function scoreSpotifyCandidate(candidate, expectedTitle, expectedArtist) {
+  const titleScore = scoreTextMatch(expectedTitle, candidate.name);
+  const artistScore = expectedArtist
+    ? Math.max(...(candidate.artists || [""]).map((artist) => scoreTextMatch(expectedArtist, artist)), 0)
+    : 1;
+  const combined = (titleScore * 0.75) + (artistScore * 0.25);
+  return { titleScore, artistScore, combined };
+}
+
+function pickBestSpotifyTrack(candidates, expectedTitle, expectedArtist) {
+  const scored = (candidates || [])
+    .map((candidate) => ({ candidate, ...scoreSpotifyCandidate(candidate, expectedTitle, expectedArtist) }))
+    .sort((a, b) => b.combined - a.combined);
+
+  const best = scored[0];
+  if (!best) return null;
+
+  const threshold = expectedArtist ? 0.82 : 0.72;
+  if (best.combined < threshold) return null;
+  if (expectedArtist && best.artistScore < 0.6) return null;
+  if (best.titleScore < 0.7) return null;
+  return best.candidate;
+}
+
+async function decorateSpotifyTrackUri(trackUri) {
+  const uri = String(trackUri || "").trim();
+  if (!uri.startsWith("spotify:track:")) return null;
+
+  const accessToken = await getSpotifyPublicAccessToken();
+  const clientToken = await getSpotifyAnonymousClientToken();
+  const body = {
+    variables: { uris: [uri] },
+    extensions: {
+      persistedQuery: {
+        version: 1,
+        sha256Hash: "f952da037440f694cc6925b9e3f649d39077a744c4db7dfba01cb883723f4f77",
+      },
+    },
+  };
+
+  const res = await axios.post(
+    "https://api-partner.spotify.com/pathfinder/v1/query",
+    body,
+    {
+      timeout: 12000,
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        Authorization: `Bearer ${accessToken}`,
+        "client-token": clientToken,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      },
+    }
+  );
+
+  const lookup = res.data?.data?.lookupEntities || [];
+  const entity = lookup.find((e) => e?.__typename === "Entity" && e?.typedEntity?.data?.__typename === "Track") || null;
+  const track = entity?.typedEntity?.data || null;
+  if (!track) return null;
+
+  const artists = (track.artists?.items || []).map((a) => a?.profile?.name || a?.name || "").filter(Boolean);
+  const album = track.albumOfTrack || null;
+  return {
+    id: uri.split(":").pop(),
+    uri,
+    name: track.name || null,
+    artists,
+    album: album?.name || null,
+    albumUri: album?.uri || null,
+    durationMs: track.duration?.totalMilliseconds || null,
+    isPlayable: track.playability?.playable !== false,
+    linkedFrom: track.relinkingInformation?.linkedTrack?.__typename === "Track"
+      ? track.relinkingInformation.linkedTrack.uri
+      : null,
+    artworkUrl: album?.coverArt?.sources?.[0]?.url || null,
+  };
+}
+
+async function searchSpotifyTracksPartner(query, limit = 5) {
+  const accessToken = await getSpotifyPublicAccessToken();
+  const clientToken = await getSpotifyAnonymousClientToken();
+  const body = {
+    operationName: "searchSuggestions",
+    variables: {
+      query: String(query || "").trim(),
+      limit: Math.min(Math.max(Number(limit) || 5, 1), 30),
+      numberOfTopResults: Math.min(Math.max(Number(limit) || 5, 1), 30),
+      offset: 0,
+      includeAuthors: true,
+      includeAlbumPreReleases: false,
+      includeEpisodeContentRatingsV2: false,
+    },
+    extensions: {
+      persistedQuery: {
+        version: 1,
+        sha256Hash: "556f5a15b2fdd3a7113ffd377ad9805e38a3a27b8bb1ca7d6d76bad54aa8ee12",
+      },
+    },
+  };
+
+  const res = await axios.post(
+    "https://api-partner.spotify.com/pathfinder/v1/query",
+    body,
+    {
+      timeout: 12000,
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      Authorization: `Bearer ${accessToken}`,
+      "client-token": clientToken,
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    },
+  }
+  );
+
+  const items = res.data?.data?.searchV2?.topResultsV2?.itemsV2 || [];
+  return items
+    .map((item) => {
+      const track = item?.item?.data || item?.track || item?.itemV2?.data?.track || item?.itemV2?.data || item?.data || item;
+      const uri = extractSpotifyTrackUri(track || item);
+      if (!uri) return null;
+      const trackId = uri.split(":").pop();
+      const title = track?.name || item?.name || item?.item?.data?.name || item?.itemV2?.data?.name || "";
+      const artists = (track?.artists?.items || item?.artists?.items || item?.item?.data?.artists?.items || item?.itemV2?.data?.artists?.items || [])
+        .map((a) => a?.profile?.name || a?.name || "")
+        .filter(Boolean);
+      return {
+        id: trackId,
+        name: title,
+        artists,
+        uri,
+        externalUrl: `https://open.spotify.com/track/${trackId}`,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+async function findSpotifyTrackByISRC(isrc) {
+  const code = String(isrc || "").trim().toUpperCase();
+  if (!code) return null;
+  try {
+    const results = await searchSpotifyTracks(`isrc:${code}`, 5);
+    if (results[0]) return results[0];
+  } catch {}
+  return null;
+}
+
+async function findSpotifyTrackByTitleArtist(title, artist) {
+  const q = [title, artist].filter(Boolean).join(" ").trim();
+  if (!q) return null;
+  const expectedTitle = String(title || "").trim();
+  const expectedArtist = String(artist || "").trim();
+
+  if (SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET) {
+    try {
+      const results = await searchSpotifyTracks(q, 5);
+      const best = pickBestSpotifyTrack(results, expectedTitle, expectedArtist);
+      if (best) return best;
+    } catch {}
+  }
+
+  try {
+    const results = await searchSpotifyTracksPartner(q, 5);
+    const best = pickBestSpotifyTrack(results, expectedTitle, expectedArtist);
+    if (best) return best;
+  } catch {}
+
+  try {
+    const results = await searchSpotifyTracksPublic(q, 5);
+    return pickBestSpotifyTrack(results, expectedTitle, expectedArtist);
+  } catch {
+    return null;
   }
 }
 
@@ -656,6 +1114,15 @@ module.exports = {
   getArtistTopTracks,
   getTrackOembed,
   searchArtistsDirect,
+  searchSpotifyTracks,
+  searchSpotifyTracksPartner,
+  searchSpotifyTracksPublic,
+  findSpotifyTrackByISRC,
+  findSpotifyTrackByTitleArtist,
+  decorateSpotifyTrackUri,
+  getSpotifyPublicAccessToken,
+  getSpotifyPublicAccessTokenMeta,
+  getSpotifyAnonymousClientToken,
   getArtistInfo,
   getArtistDescription,
   searchArtistDeezer,

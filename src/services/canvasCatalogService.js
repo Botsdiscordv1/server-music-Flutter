@@ -860,6 +860,8 @@ function createPendingRecord(input = {}) {
 async function ensureFolderRecord(input = {}) {
   requireReleaseName(input);
   const enriched = await enrichCanvasMetadata(input, { forceRefresh: input.refresh === true });
+  const existing = resolveRecord(enriched);
+  if (existing) return existing;
   ensurePhysicalFolder({ ...enriched, status: enriched.status || "pending" });
   return createPendingRecord({ ...enriched, status: enriched.status || "pending" });
 }
@@ -920,6 +922,7 @@ function inferLevelFromLeaf(leafName) {
 }
 
 function syncRecordFromFolder(folderPath, bucket, status = READY_DIR) {
+  if (!fs.existsSync(folderPath)) return null;
   const rootDir = path.join(CANVAS_LIBRARY_ROOT, LIBRARY_DIR, bucket, normalizeStorageStatus(status));
   const rel = path.relative(rootDir, folderPath);
   if (!rel || rel.startsWith("..")) return null;
@@ -972,7 +975,12 @@ function syncRecordFromFolder(folderPath, bucket, status = READY_DIR) {
     canonicalId = `${bucket}/${folderName}`;
   }
 
-  const files = fs.readdirSync(folderPath, { withFileTypes: true });
+  let files;
+  try {
+    files = fs.readdirSync(folderPath, { withFileTypes: true });
+  } catch {
+    return null;
+  }
   const hasSubdirs = files.some((entry) => entry.isDirectory());
   if (hasSubdirs && parts.length !== 3) return null;
 

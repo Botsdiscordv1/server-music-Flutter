@@ -1700,6 +1700,7 @@ async function validateStreamUrl(url) {
 }
 
 async function getStreamUrl(videoId, options = {}) {
+  const isVideo = options.isVideo === true;
   const cacheKey = options.poToken ? `${videoId}:${options.poToken.slice(0, 12)}` : videoId;
   const cached = playerCache.get(cacheKey);
   let player = null;
@@ -1733,10 +1734,37 @@ async function getStreamUrl(videoId, options = {}) {
     });
   }
 
-  const { adaptiveFormats } = player.streamingData;
-  if (!adaptiveFormats?.length) {
+  const { formats = [], adaptiveFormats = [] } = player.streamingData;
+  if (!adaptiveFormats.length && !formats.length) {
     console.warn(`[InnerTube] getStreamUrl(${videoId}): no adaptiveFormats`);
     return null;
+  }
+
+  if (isVideo) {
+    const videoFormats = formats
+      .filter((f) => f.mimeType?.startsWith("video/") && (f.url || f.signatureCipher || f.cipher))
+      .map((f) => {
+        if (f.url) return f;
+        const resolvedUrl = resolveCipher(f);
+        return resolvedUrl ? { ...f, url: resolvedUrl } : null;
+      })
+      .filter(Boolean);
+
+    if (!videoFormats.length) {
+      console.warn(`[InnerTube] getStreamUrl(${videoId}): no muxed video formats`);
+      return null;
+    }
+
+    videoFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const bestVideo = videoFormats[0];
+    console.log(`[InnerTube] getStreamUrl(${videoId}): selected video itag=${bestVideo.itag} mime=${bestVideo.mimeType || 'unknown'} bitrate=${bestVideo.bitrate || 0}`);
+    return {
+      url: bestVideo.url,
+      itag: bestVideo.itag,
+      mimeType: bestVideo.mimeType,
+      bitrate: bestVideo.bitrate,
+      expiresInSeconds,
+    };
   }
 
   // 1. Recolectar formatos de audio con URL directa y vía cipher.

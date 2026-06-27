@@ -25,6 +25,7 @@ const radioService = require("../services/radioService");
 const eventCollectorService = require("../services/eventCollectorService");
 const rulePerformanceStore = require("../services/rulePerformanceStore");
 const canvasCatalogService = require("../services/canvasCatalogService");
+const spotifyCanvasScraper = require("../services/spotifyCanvasScraper");
 const { emitUserEvent } = require("../services/realtime");
 const { getUserState, transferActiveDevice } = require("../services/deviceSessionService");
 const { isExcluded, scoreTrack: scoreTrackBase } = require("../utils/trackFilter");
@@ -811,7 +812,7 @@ async function doResolveStreamUrl(videoId, req = null, isVideo = false, streamOp
 
   // A. InnerTube directo primero: suele responder antes que yt-dlp/play-dl
   try {
-    const streamResult = await innertube.getStreamUrl(videoId, streamOptions);
+    const streamResult = await innertube.getStreamUrl(videoId, { ...streamOptions, isVideo });
     if (streamResult?.url) {
       console.log(`[stream] InnerTube success for ${videoId}`);
       setCached(cacheKey, streamResult.url);
@@ -882,7 +883,7 @@ async function resolveViaCobalt(videoId, isVideo = false) {
     downloadMode: isVideo ? "auto" : "audio",
     audioFormat: "best",
     filenameStyle: "basic",
-    ...(isVideo ? { videoQuality: "720", youtubeVideoCodec: "h264" } : {}),
+    ...(isVideo ? { youtubeVideoCodec: "h264" } : {}),
   };
   const instances = [
     { url: "https://apicobalt.mgytr.top", payload: basePayload },
@@ -1781,6 +1782,102 @@ app.post("/api/canvas/request", requireApiKey, async (req, res) => {
   }
 });
 
+app.post("/api/resolve/spotify-url", requireApiKey, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const isrc = String(body.isrc || "").trim();
+    const title = String(body.title || "").trim();
+    const artist = String(body.artist || body.trackArtist || "").trim();
+
+    let track = null;
+    if (isrc) {
+      track = await spotify.findSpotifyTrackByISRC(isrc);
+    }
+    if (!track && (title || artist)) {
+      track = await spotify.findSpotifyTrackByTitleArtist(title, artist);
+    }
+
+    if (!track) {
+      return res.json({ found: false });
+    }
+
+    res.json({
+      found: true,
+      spotifyTrackId: track.id,
+      spotifyUrl: track.externalUrl || `https://open.spotify.com/track/${track.id}`,
+      track,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/canvas/from-track", requireApiKey, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const isrc = String(body.isrc || "").trim();
+    const title = String(body.title || "").trim();
+    const artist = String(body.artist || body.trackArtist || "").trim();
+    const refresh = body.refresh === true;
+
+    canvasCatalogService.syncFilesystemCatalog();
+
+    let track = null;
+    if (isrc) track = await spotify.findSpotifyTrackByISRC(isrc);
+    if (!track && (title || artist)) track = await spotify.findSpotifyTrackByTitleArtist(title, artist);
+
+    if (!track) {
+      return res.json({ found: false, error: "Spotify track not found" });
+    }
+
+    const spotifyUrl = track.externalUrl || `https://open.spotify.com/track/${track.id}`;
+    const existing = !refresh ? canvasCatalogService.resolveRecord({ spotifyTrackId: track.id }) : null;
+    if (existing) {
+      const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+      logCanvas(`Canvas from-track: already exists -> ${existing.canonicalId}`);
+      return res.json({
+        found: true,
+        item: canvasCatalogService.attachUrls(existing, baseUrl),
+        source: "cache",
+        spotifyUrl,
+        spotifyTrackId: track.id,
+      });
+    }
+
+    const canvasResult = await spotifyCanvasScraper.getCanvasUrl(spotifyUrl);
+    if (!canvasResult?.url) {
+      return res.json({
+        found: false,
+        error: "No canvas found for this Spotify track",
+        spotifyUrl,
+        spotifyTrackId: track.id,
+      });
+    }
+
+    const record = await canvasCatalogService.requestRecord({
+      ...body,
+      spotifyTrackId: track.id,
+      canvasUrl: canvasResult.url,
+      source: "spotify",
+      title: body.title || track.name,
+      artist: body.artist || track.artists?.join(", "),
+      releaseName: body.releaseName || body.album || track.name || title,
+    });
+
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas from-track: downloaded -> ${record.canonicalId} [${canvasResult.source}]`);
+    res.json({
+      found: true,
+      item: canvasCatalogService.attachUrls(record, baseUrl),
+      source: canvasResult.source,
+      spotifyUrl,
+      spotifyTrackId: track.id,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/canvas/ensure-folder", requireApiKey, async (req, res) => {
   try {
     const body = req.body || {};
@@ -1792,6 +1889,55 @@ app.post("/api/canvas/ensure-folder", requireApiKey, async (req, res) => {
       item: canvasCatalogService.attachUrls(record, baseUrl),
       folderPath: record.assetPaths?.canvas ? path.dirname(record.assetPaths.canvas) : null,
       queued: true,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/canvas/from-spotify", requireApiKey, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const trackId = body.spotifyTrackId || body.trackId;
+    if (!trackId) {
+      return res.status(400).json({ error: "spotifyTrackId or trackId required" });
+    }
+
+    canvasCatalogService.syncFilesystemCatalog();
+
+    const existing = canvasCatalogService.resolveRecord({ spotifyTrackId: trackId });
+    if (existing && !body.refresh) {
+      const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+      logCanvas(`Canvas from-spotify: already exists -> ${existing.canonicalId}`);
+      return res.json({
+        found: true,
+        item: canvasCatalogService.attachUrls(existing, baseUrl),
+        source: "cache",
+      });
+    }
+
+    const canvasResult = await spotifyCanvasScraper.getCanvasUrl(trackId);
+    if (!canvasResult?.url) {
+      return res.json({
+        found: false,
+        error: "No canvas found for this Spotify track",
+      });
+    }
+
+    const record = await canvasCatalogService.requestRecord({
+      ...body,
+      spotifyTrackId: trackId,
+      canvasUrl: canvasResult.url,
+      source: "spotify",
+      releaseName: body.releaseName || body.album || body.title || body.trackTitle || trackId,
+    });
+
+    const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
+    logCanvas(`Canvas from-spotify: downloaded -> ${record.canonicalId} [${canvasResult.source}]`);
+    res.json({
+      found: true,
+      item: canvasCatalogService.attachUrls(record, baseUrl),
+      source: canvasResult.source,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
