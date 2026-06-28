@@ -2654,26 +2654,45 @@ app.get("/api/artist/info", requireApiKey, async (req, res) => {
       const existing = artistInfoCache.get(name);
       if (existing) return existing;
 
-      const [deezerInfo, description, spotifyArtists] = await Promise.all([
-        spotify.searchArtistDeezer(name),
-        spotify.getArtistDescription(name),
-        spotify.searchArtistsDirect(name, 3).catch(() => []),
-      ]);
-
-      let innertubeBio = null;
-      if (!description) {
-        try {
-          const browseId = await innertube.searchArtistBrowseId(name, req.userId || req.query.userId || "guest");
-          if (browseId) {
-            const artistPage = await innertube.getArtistPage(browseId, req.userId || req.query.userId || "guest");
-            innertubeBio = artistPage?.artist?.bio || null;
+      const userId = req.userId || req.query.userId || "guest";
+      let innerTubeInfo = null;
+      try {
+        const browseId = await innertube.searchArtistBrowseId(name, userId);
+        if (browseId) {
+          const artistPage = await innertube.getArtistPage(browseId, userId);
+          if (artistPage?.artist) {
+            innerTubeInfo = {
+              name: artistPage.artist.title || name,
+              image: artistPage.artist.artworkUrl || null,
+              imageBig: artistPage.artist.artworkUrl || null,
+              imageXl: artistPage.artist.artworkUrl || null,
+              fans: artistPage.artist.subscriberCount || 0,
+              albums: 0,
+              description: artistPage.artist.bio || null,
+              descriptionSource: artistPage.artist.bio ? "innertube" : null,
+              descriptionUrl: null,
+              source: "innertube",
+            };
           }
-        } catch (err) {
-          console.warn(`[artist/info] InnerTube bio fallback failed for "${name}": ${err.message}`);
         }
+      } catch (err) {
+        console.warn(`[artist/info] InnerTube primary failed for "${name}": ${err.message}`);
       }
 
-      if (!deezerInfo && !description && !spotifyArtists.length) {
+      const needsFallback = !innerTubeInfo || !innerTubeInfo.image || !innerTubeInfo.description || !innerTubeInfo.fans;
+      let deezerInfo = null;
+      let description = null;
+      let spotifyArtists = [];
+
+      if (needsFallback) {
+        [deezerInfo, description, spotifyArtists] = await Promise.all([
+          spotify.searchArtistDeezer(name),
+          spotify.getArtistDescription(name),
+          spotify.searchArtistsDirect(name, 3).catch(() => []),
+        ]);
+      }
+
+      if (!innerTubeInfo && !deezerInfo && !description && !spotifyArtists.length) {
         return null;
       }
 
@@ -2681,16 +2700,16 @@ app.get("/api/artist/info", requireApiKey, async (req, res) => {
         || spotifyArtists[0];
 
       const payload = {
-        name: deezerInfo?.name || spotifyArtist?.name || name,
-        image: deezerInfo?.image || spotifyArtist?.image || null,
-        imageBig: deezerInfo?.imageBig || spotifyArtist?.image || null,
-        imageXl: deezerInfo?.imageXl || spotifyArtist?.image || null,
-        fans: deezerInfo?.fans || spotifyArtist?.followers || 0,
-        albums: deezerInfo?.albums || 0,
-        description: description?.description || innertubeBio || null,
-        descriptionSource: description?.source || (innertubeBio ? "innertube" : null),
+        name: innerTubeInfo?.name || deezerInfo?.name || spotifyArtist?.name || name,
+        image: innerTubeInfo?.image || deezerInfo?.image || spotifyArtist?.image || null,
+        imageBig: innerTubeInfo?.imageBig || deezerInfo?.imageBig || spotifyArtist?.image || null,
+        imageXl: innerTubeInfo?.imageXl || deezerInfo?.imageXl || spotifyArtist?.image || null,
+        fans: innerTubeInfo?.fans || deezerInfo?.fans || spotifyArtist?.followers || 0,
+        albums: innerTubeInfo?.albums || deezerInfo?.albums || 0,
+        description: innerTubeInfo?.description || description?.description || null,
+        descriptionSource: innerTubeInfo?.descriptionSource || description?.source || null,
         descriptionUrl: description?.url || null,
-        source: "deezer+wikipedia",
+        source: innerTubeInfo ? "innertube+fallback" : "deezer+wikipedia",
       };
 
       artistInfoCache.set(name, { ...payload, ts: Date.now() });
