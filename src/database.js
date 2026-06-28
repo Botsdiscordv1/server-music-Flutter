@@ -168,63 +168,7 @@ const FollowedArtist = mongoose.model("FollowedArtist", followedArtistSchema);
 const MetadataPool = mongoose.model("MetadataPool", metadataPoolSchema);
 const Event = mongoose.model("Event", eventSchema);
 const RulePerformance = mongoose.model("RulePerformance", rulePerformanceSchema);
-// ── Discord connection (separate DB) ──────────────────────────────────
-const discordUri = process.env.DISCORD_MONGODB_URI;
-const DISCORD_CONN_OPTS = {
-  connectTimeoutMS: 10000,
-  socketTimeoutMS: 45000,
-  serverSelectionTimeoutMS: 15000,
-  heartbeatFrequencyMS: 10000,
-  maxPoolSize: 10,
-  minPoolSize: 1,
-  retryWrites: true,
-  retryReads: true,
-};
-const discordConn = discordUri ? mongoose.createConnection(discordUri, DISCORD_CONN_OPTS) : null;
-
-let DiscordUser = null;
-let DiscordUserStats = null;
-let DiscordPlaylist = null;
-let DiscordHistory = null;
-let DiscordLikedSong = null;
-let DiscordTrackPlay = null;
-let DiscordDislikedSong = null;
-let DiscordLikedAlbum = null;
-let DiscordFollowedArtist = null;
-let DiscordMetadataPool = null;
-let DiscordEvent = null;
-let DiscordRulePerformance = null;
-if (discordConn) {
-  DiscordUser = discordConn.model("User", userSchema);
-  DiscordUserStats = discordConn.model("UserStats", userStatsSchema);
-  DiscordPlaylist = discordConn.model("Playlist", playlistSchema);
-  DiscordHistory = discordConn.model("History", historySchema);
-  DiscordLikedSong = discordConn.model("LikedSong", likedSongSchema);
-  DiscordTrackPlay = discordConn.model("TrackPlay", trackPlaySchema);
-  DiscordDislikedSong = discordConn.model("DislikedSong", dislikedSongSchema);
-  DiscordLikedAlbum = discordConn.model("LikedAlbum", likedAlbumSchema);
-  DiscordFollowedArtist = discordConn.model("FollowedArtist", followedArtistSchema);
-  DiscordMetadataPool = discordConn.model("MetadataPool", metadataPoolSchema);
-  DiscordEvent = discordConn.model("Event", eventSchema);
-  DiscordRulePerformance = discordConn.model("RulePerformance", rulePerformanceSchema);
-}
-
 function getModels(source) {
-  if (source === "discord" && discordConn) {
-    return {
-      UserStats: DiscordUserStats,
-      Playlist: DiscordPlaylist,
-      History: DiscordHistory,
-      LikedSong: DiscordLikedSong,
-      TrackPlay: DiscordTrackPlay,
-      DislikedSong: DiscordDislikedSong,
-      LikedAlbum: DiscordLikedAlbum,
-      FollowedArtist: DiscordFollowedArtist,
-      MetadataPool: DiscordMetadataPool,
-      Event: DiscordEvent,
-      RulePerformance: DiscordRulePerformance,
-    };
-  }
   return {
     UserStats, Playlist, History, LikedSong, TrackPlay,
     DislikedSong, LikedAlbum, FollowedArtist, MetadataPool,
@@ -246,15 +190,6 @@ async function initDB() {
     retryWrites: true,
     retryReads: true,
   });
-
-  if (discordConn) {
-    try {
-      await discordConn.asPromise();
-      console.log("Conectado Discord DB");
-    } catch (err) {
-      console.warn("Discord DB no disponible (no fatal):", err.message);
-    }
-  }
 
   dbReady = true;
   queue.forEach(fn => fn());
@@ -965,7 +900,7 @@ function getRecentPlaybackModel(userId, source = "android") {
   if (recentPlaybackModels.has(key)) return recentPlaybackModels.get(key);
 
   const collectionName = `recent_playback_${userId}`;
-  const conn = source === "discord" && discordConn ? discordConn : mongoose.connection;
+  const conn = mongoose.connection;
   const model = conn.model(collectionName, recentPlaybackSchema, collectionName);
   recentPlaybackModels.set(key, model);
   return model;
@@ -1409,7 +1344,6 @@ module.exports = {
   queryMetadataPool,
   getMetadataPoolChangesSince,
   updateLikedSongMetadata,
-  DiscordUser,
   addRecentPlayback,
   getRecentPlayback,
   clearRecentPlayback,

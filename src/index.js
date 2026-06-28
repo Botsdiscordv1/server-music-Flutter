@@ -114,7 +114,7 @@ function scheduleCanvasSync(syncCanvasCatalog, reason = "change") {
 
 function resolveSocketUserId(payload) {
   const provider = payload.provider || "android";
-  const userId = (provider === "discord" && payload.discordId) ? payload.discordId : payload.sub;
+  const userId = payload.sub;
   return { provider, userId, mongoId: payload.sub };
 }
 

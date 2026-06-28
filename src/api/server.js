@@ -2,7 +2,6 @@ const express = require("express");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const passport = require("passport");
-const DiscordStrategy = require("passport-discord").Strategy;
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const { OAuth2Client } = require("google-auth-library");
 const googleAuthClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -11,7 +10,6 @@ googleAuthClient.getFederatedSignonCertsAsync().catch(() => {});
 const User = require("../models/User");
 const { requireApiKey, requireAuth, extractYtmCookies } = require("./middleware/auth");
 const db = require("../database");
-const { DiscordUser } = db;
 const {
   findLikedSongByUrl,
   findLikedSongById,
@@ -1594,8 +1592,7 @@ app.get("/api/stream", requireApiKey, async (req, res) => {
         query = `${artist} - ${title}`.trim();
       } else {
         // Buscar en DB por URL
-        const found = await findLikedSongByUrl(id, "android") ||
-                      await findLikedSongByUrl(id, "discord");
+        const found = await findLikedSongByUrl(id, "android");
         if (found && found.track_title) {
           query = `${found.track_author || ""} - ${found.track_title}`.trim();
         }
@@ -1620,8 +1617,7 @@ app.get("/api/stream", requireApiKey, async (req, res) => {
     // (E) MongoDB ObjectID → buscar canción en DB y extraer video ID
     let resolvedId = id;
     if (/^[0-9a-f]{24}$/i.test(id)) {
-      const found = await findLikedSongById(id, "android") ||
-                    await findLikedSongById(id, "discord");
+      const found = await findLikedSongById(id, "android");
       if (found?.track_url) {
         const vid = extractVideoId(found.track_url);
         if (vid) resolvedId = vid;
@@ -1656,7 +1652,7 @@ app.get("/api/stream", requireApiKey, async (req, res) => {
 
 // (C) Endpoint de migración: reemplaza URLs de Deezer/Spotify por YTM en MongoDB
 app.post("/api/admin/migrate-liked-urls", requireApiKey, async (req, res) => {
-  const sources = ["android", "discord"];
+  const sources = ["android"];
   const results = {};
   let totalGlobal = 0, updatedGlobal = 0, failedGlobal = 0;
 
@@ -3025,8 +3021,7 @@ app.get("/api/init", requireAuth, async (req, res) => {
 
     const [userData, likedSongs, likedAlbums, followedArtists, playlists, recentPlayback, stats] = await Promise.all([
       withFallback((async () => {
-        const UserModel = source === "discord" && DiscordUser ? DiscordUser : User;
-        const u = await UserModel.findById(mongoId).lean();
+        const u = await User.findById(mongoId).lean();
         return u ? { id: u._id.toString(), username: u.username, email: u.email, avatar: u.avatar, discordId: u.discordId, googleId: u.googleId, createdAt: u.createdAt } : null;
       })(), null),
       withFallback(db.getLikedSongs(userId, 200, source), []),
@@ -3054,8 +3049,7 @@ app.post("/api/sync", requireAuth, async (req, res) => {
 
     const result = await db.syncUserData(userId, req.body, source);
 
-    const UserModel = source === "discord" && DiscordUser ? DiscordUser : User;
-    const user = await UserModel.findById(mongoId).lean();
+    const user = await User.findById(mongoId).lean();
     if (user) {
       result.user = {
         id: user._id.toString(),
@@ -3115,9 +3109,6 @@ const JWT_EXPIRES = "30d";
 
 function signToken(user, provider = "android") {
   const payload = { sub: user._id.toString(), provider };
-  if (provider === "discord" && user.discordId) {
-    payload.discordId = user.discordId;
-  }
   return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES });
 }
 
@@ -3177,41 +3168,6 @@ function sendGoogleAuthResult(req, res, user) {
 
   return res.redirect(`${redirectUri}${redirectUri.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`);
 }
-
-// ── Discord OAuth Strategy ────────────────────────────────────────────
-passport.use(new DiscordStrategy({
-  clientID: process.env.DISCORD_CLIENT_ID,
-  clientSecret: process.env.DISCORD_CLIENT_SECRET,
-  callbackURL: process.env.DISCORD_CALLBACK_URL || "http://192.168.18.81:3000/api/auth/discord/callback",
-  scope: ["identify", "email"],
-}, async (accessToken, refreshToken, profile, done) => {
-  try {
-    if (!DiscordUser) return done(new Error("Discord database not configured"));
-    let user = await DiscordUser.findOne({ discordId: profile.id });
-    if (user) return done(null, user);
-
-    const email = normalizeEmail(profile.email);
-    if (email) {
-      user = await DiscordUser.findOne({ email });
-      if (user) {
-        user.discordId = profile.id;
-        if (!user.avatar && profile.avatar) user.avatar = `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png`;
-        await user.save();
-        return done(null, user);
-      }
-    }
-
-    user = await DiscordUser.create({
-      username: profile.username || profile.global_name || `discord_${profile.id}`,
-      email,
-      discordId: profile.id,
-      avatar: profile.avatar ? `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.png` : "",
-    });
-    return done(null, user);
-  } catch (err) {
-    return done(err);
-  }
-}));
 
 // ── Google OAuth Strategy ─────────────────────────────────────────────
 passport.use(new GoogleStrategy({
@@ -3301,63 +3257,12 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/auth/me", requireAuth, async (req, res) => {
   try {
-    const UserModel = req.provider === "discord" && DiscordUser ? DiscordUser : User;
-    const user = await UserModel.findById(req.mongoId).exec();
+    const user = await User.findById(req.mongoId).exec();
     if (!user) return res.status(404).json({ error: "User not found" });
     res.json({ user: user.toPublicJSON() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-});
-
-// ── Discord OAuth routes ──────────────────────────────────────────────
-app.get("/api/auth/discord", (req, res, next) => {
-  const state = req.query?.state;
-  const ua = (req.headers["user-agent"] || "").toLowerCase();
-  console.log(`[Discord Auth] Init: state=${state} ua=${ua.substring(0, 60)}`);
-  const opts = { session: false, state };
-  passport.authenticate("discord", opts)(req, res, next);
-});
-
-app.get("/api/auth/discord/callback", (req, res, next) => {
-  console.log(`[Discord Auth] Callback received: query=${JSON.stringify(req.query)} error=${req.query?.error}`);
-  passport.authenticate("discord", { session: false }, (err, user) => {
-    if (err || !user) {
-      console.error(`[Discord Auth] Callback error: err=${err?.message} user=${!!user}`);
-      return res.status(401).json({ error: "auth_failed" });
-    }
-    const token = signToken(user, "discord");
-    console.log(`[Discord Auth] Authenticated: userId=${user._id} discordId=${user.discordId}`);
-
-    // App (HTTP nativo): JSON directo. Navegador/WebView: 302 redirect
-    const ua = (req.headers["user-agent"] || "").toLowerCase();
-    if (ua.includes("okhttp") || ua.includes("dalvik")) {
-      console.log(`[Discord Auth] Native app response`);
-      return res.json({ token, user: user.toPublicJSON() });
-    }
-
-    const fallback = process.env.CLIENT_URL || "auris://auth";
-    const state = req.query?.state;
-    let redirectUrl = `${fallback}?token=${encodeURIComponent(token)}`;
-    console.log(`[Discord Auth] state=${state} fallback=${fallback}`);
-
-    if (state) {
-      try {
-        const decoded = decodeURIComponent(state);
-        const uri = new URL(decoded);
-        const isLoopback = uri.hostname === "127.0.0.1" || uri.hostname === "localhost";
-        console.log(`[Discord Auth] Decoded state: ${decoded} isLoopback=${isLoopback}`);
-        if ((uri.protocol === "http:" || uri.protocol === "https:") && isLoopback) {
-          redirectUrl = `${uri.toString().replace(/\/$/, "")}?token=${encodeURIComponent(token)}`;
-        }
-      } catch (e) {
-        console.error(`[Discord Auth] State parse error: ${e.message}`);
-      }
-    }
-
-    console.log(`[Discord Auth] Redirecting to: ${redirectUrl}`);
-    res.redirect(redirectUrl);
-  })(req, res, next);
 });
 
 app.get("/api/auth/google/callback", (req, res, next) => {
