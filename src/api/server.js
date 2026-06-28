@@ -1854,6 +1854,12 @@ app.post("/api/canvas/from-track", requireApiKey, async (req, res) => {
       });
     }
 
+    const bodyReleaseName = String(body.releaseName || "").trim();
+    const trackTitle = String(track.name || title || "").trim();
+    const preferredReleaseName = bodyReleaseName && bodyReleaseName.toLowerCase() !== trackTitle.toLowerCase()
+      ? bodyReleaseName
+      : null;
+
     const record = await canvasCatalogService.requestRecord({
       ...body,
       spotifyTrackId: track.id,
@@ -1861,7 +1867,8 @@ app.post("/api/canvas/from-track", requireApiKey, async (req, res) => {
       source: "spotify",
       title: body.title || track.name,
       artist: body.artist || track.artists?.join(", "),
-      releaseName: body.releaseName || body.album || track.name || title,
+      albumType: track.albumType || body.albumType || body.releaseType || null,
+      releaseName: body.album || track.album || preferredReleaseName || track.name || title,
     });
 
     const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;
@@ -1924,12 +1931,22 @@ app.post("/api/canvas/from-spotify", requireApiKey, async (req, res) => {
       });
     }
 
+    const trackInfo = typeof body === "object" && body.albumType ? body
+      : await spotify.searchSpotifyTracks(`track:${trackId}`, 1).then(r => r[0]).catch(() => ({}));
+
+    const bodyReleaseName = String(body.releaseName || "").trim();
+    const trackTitle = String(trackInfo?.name || "").trim();
+    const preferredReleaseName = bodyReleaseName && bodyReleaseName.toLowerCase() !== trackTitle.toLowerCase()
+      ? bodyReleaseName
+      : null;
+
     const record = await canvasCatalogService.requestRecord({
       ...body,
       spotifyTrackId: trackId,
       canvasUrl: canvasResult.url,
       source: "spotify",
-      releaseName: body.releaseName || body.album || body.title || body.trackTitle || trackId,
+      albumType: body.albumType || body.releaseType || trackInfo?.albumType || null,
+      releaseName: body.album || trackInfo?.album || preferredReleaseName || body.title || body.trackTitle || trackId,
     });
 
     const baseUrl = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.get("host")}`;

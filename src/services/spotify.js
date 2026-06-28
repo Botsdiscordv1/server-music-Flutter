@@ -108,6 +108,7 @@ async function searchSpotifyTracks(query, limit = 5) {
     name: t.name,
     artists: (t.artists || []).map((a) => a.name),
     album: t.album?.name || null,
+    albumType: t.album?.album_type || null,
     image: t.album?.images?.[0]?.url || null,
     uri: t.uri,
     externalUrl: t.external_urls?.spotify || null,

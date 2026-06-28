@@ -46,7 +46,14 @@ function normalizeText(value) {
 }
 
 function safeSegment(value) {
-  return normalizeText(value).replace(/\s+/g, "-") || "unknown";
+  return String(value || "")
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toLowerCase() || "unknown";
 }
 
 function splitCanonicalId(canonicalId) {
@@ -90,12 +97,14 @@ function normalizeReleaseType(value) {
   const v = normalizeText(value);
   if (!v) return null;
   if (v.startsWith("ep")) return "EP";
+  if (v.startsWith("single") || v.includes("single")) return "Single";
+  if (v.startsWith("compilation") || v.includes("compilation")) return "Compilation";
   if (v.includes("album")) return "Album";
   return value ? String(value).trim() : null;
 }
 
 function isConfirmedReleaseType(value) {
-  return value === "Album" || value === "EP";
+  return value === "Album" || value === "EP" || value === "Single" || value === "Compilation";
 }
 
 function normalizeStorageReleaseType(value) {
@@ -625,9 +634,14 @@ function resolveReleaseTypeForGroup(candidateType, groupItems = [], totalItems =
   const normalizedCandidate = normalizeReleaseType(candidateType);
   const groupTypes = groupItems.map((item) => normalizeReleaseType(item.releaseType || item.albumType || null)).filter(Boolean);
 
+  if (normalizedCandidate === "Album" || normalizedCandidate === "EP" || normalizedCandidate === "Single" || normalizedCandidate === "Compilation") {
+    return normalizedCandidate;
+  }
+
   if (groupTypes.includes("Album")) return "Album";
   if (groupTypes.includes("EP")) return "EP";
-  if (normalizedCandidate === "Album" || normalizedCandidate === "EP") return normalizedCandidate;
+  if (groupTypes.includes("Single")) return "Single";
+  if (groupTypes.includes("Compilation")) return "Compilation";
 
   if (totalItems > 1) {
     if (groupItems.some((item) => normalizeReleaseType(item.releaseType || item.albumType || null) === "EP" || normalizeText(item.albumType || item.releaseType || "").includes("ep"))) {
@@ -953,6 +967,18 @@ function syncRecordFromFolder(folderPath, bucket, status = READY_DIR) {
   pathReleaseType = existingMeta.releaseType || null;
   pathReleaseName = existingMeta.releaseName || existingMeta.album || null;
 
+  const metaTitle = String(existingMeta.title || folderName || "").trim();
+  const metaAlbum = String(existingMeta.album || "").trim();
+  const metaReleaseName = String(existingMeta.releaseName || "").trim();
+  const releaseNameLooksLikeTitle = metaTitle && normalizeText(metaReleaseName || pathReleaseName || folderName) === normalizeText(metaTitle);
+  const preferredReleaseName = metaAlbum && (releaseNameLooksLikeTitle || !metaReleaseName || normalizeText(metaReleaseName) === normalizeText(folderName))
+    ? metaAlbum
+    : (metaReleaseName || metaAlbum || null);
+
+  if (preferredReleaseName) {
+    pathReleaseName = preferredReleaseName;
+  }
+
   if (parts.length >= 4) {
     const [artist, releaseType, releaseName, leafId] = parts.slice(-4);
     const normalizedReleaseType = normalizeReleaseType(releaseType) || releaseType;
@@ -1009,7 +1035,7 @@ function syncRecordFromFolder(folderPath, bucket, status = READY_DIR) {
     artist: existingMeta.artist || pathArtist || "",
     primaryArtist: existingMeta.primaryArtist || existingMeta.artist || pathArtist || "",
     album: existingMeta.album || null,
-    releaseName: existingMeta.releaseName || existingMeta.album || pathReleaseName || null,
+    releaseName: pathReleaseName || existingMeta.releaseName || existingMeta.album || null,
     releaseType: normalizeStorageReleaseType(existingMeta.releaseType || pathReleaseType),
     level: existingMeta.level || pathLevel || level,
     durationMs: existingMeta.durationMs || 0,
