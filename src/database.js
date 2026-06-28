@@ -170,7 +170,17 @@ const Event = mongoose.model("Event", eventSchema);
 const RulePerformance = mongoose.model("RulePerformance", rulePerformanceSchema);
 // ── Discord connection (separate DB) ──────────────────────────────────
 const discordUri = process.env.DISCORD_MONGODB_URI;
-const discordConn = discordUri ? mongoose.createConnection(discordUri) : null;
+const DISCORD_CONN_OPTS = {
+  connectTimeoutMS: 10000,
+  socketTimeoutMS: 45000,
+  serverSelectionTimeoutMS: 15000,
+  heartbeatFrequencyMS: 10000,
+  maxPoolSize: 10,
+  minPoolSize: 1,
+  retryWrites: true,
+  retryReads: true,
+};
+const discordConn = discordUri ? mongoose.createConnection(discordUri, DISCORD_CONN_OPTS) : null;
 
 let DiscordUser = null;
 let DiscordUserStats = null;
@@ -226,7 +236,16 @@ function getModels(source) {
 async function initDB() {
   const uri = process.env.ANDROID_MONGODB_URI || process.env.MONGODB_URI || "mongodb://localhost:27017/musicbot";
   console.log("Conectado Android DB");
-  await mongoose.connect(uri);
+  await mongoose.connect(uri, {
+    connectTimeoutMS: 5000,
+    socketTimeoutMS: 30000,
+    serverSelectionTimeoutMS: 5000,
+    heartbeatFrequencyMS: 10000,
+    maxPoolSize: 50,
+    minPoolSize: 5,
+    retryWrites: true,
+    retryReads: true,
+  });
 
   if (discordConn) {
     try {
@@ -240,6 +259,12 @@ async function initDB() {
   dbReady = true;
   queue.forEach(fn => fn());
   queue.length = 0;
+
+  // Keep-alive: ping MongoDB cada 60s para mantener conexiones activas
+  setInterval(() => {
+    mongoose.connection.db?.admin().ping().catch(() => {});
+  }, 60000);
+
   console.log("MongoDB ready");
 }
 

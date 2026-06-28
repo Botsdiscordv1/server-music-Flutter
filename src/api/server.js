@@ -4,6 +4,10 @@ const bcrypt = require("bcryptjs");
 const passport = require("passport");
 const DiscordStrategy = require("passport-discord").Strategy;
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
+const { OAuth2Client } = require("google-auth-library");
+const googleAuthClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+// Precargar certificados públicos de Google en frío para evitar latencia en el primer login
+googleAuthClient.getFederatedSignonCertsAsync().catch(() => {});
 const User = require("../models/User");
 const { requireApiKey, requireAuth, extractYtmCookies } = require("./middleware/auth");
 const db = require("../database");
@@ -3014,18 +3018,23 @@ app.get("/api/init", requireAuth, async (req, res) => {
       console.warn(`[likes] init repair skipped for ${userId}: ${err.message}`);
     });
 
+    const withFallback = (p, fallback) => p.catch(err => {
+      console.warn(`[Init] Query fallback for ${userId}: ${err.message}`);
+      return fallback;
+    });
+
     const [userData, likedSongs, likedAlbums, followedArtists, playlists, recentPlayback, stats] = await Promise.all([
-      (async () => {
+      withFallback((async () => {
         const UserModel = source === "discord" && DiscordUser ? DiscordUser : User;
         const u = await UserModel.findById(mongoId).lean();
         return u ? { id: u._id.toString(), username: u.username, email: u.email, avatar: u.avatar, discordId: u.discordId, googleId: u.googleId, createdAt: u.createdAt } : null;
-      })(),
-      db.getLikedSongs(userId, 200, source).catch(() => []),
-      db.getLikedAlbums(userId, source).catch(() => []),
-      db.getFollowedArtists(userId, source).catch(() => []),
-      db.getUserPlaylists(userId, source).catch(() => []),
-      db.getRecentPlayback(userId, 50, source).catch(() => []),
-      db.getUserStats(userId, source).catch(() => null),
+      })(), null),
+      withFallback(db.getLikedSongs(userId, 200, source), []),
+      withFallback(db.getLikedAlbums(userId, source), []),
+      withFallback(db.getFollowedArtists(userId, source), []),
+      withFallback(db.getUserPlaylists(userId, source), []),
+      withFallback(db.getRecentPlayback(userId, 50, source), []),
+      withFallback(db.getUserStats(userId, source), null),
     ]);
 
     res.json({ user: userData, likedSongs, likedAlbums, followedArtists, playlists, recentPlayback, stats });
@@ -3302,22 +3311,52 @@ app.get("/api/auth/me", requireAuth, async (req, res) => {
 });
 
 // ── Discord OAuth routes ──────────────────────────────────────────────
-app.get("/api/auth/discord", passport.authenticate("discord", { session: false }));
+app.get("/api/auth/discord", (req, res, next) => {
+  const state = req.query?.state;
+  const ua = (req.headers["user-agent"] || "").toLowerCase();
+  console.log(`[Discord Auth] Init: state=${state} ua=${ua.substring(0, 60)}`);
+  const opts = { session: false, state };
+  passport.authenticate("discord", opts)(req, res, next);
+});
 
 app.get("/api/auth/discord/callback", (req, res, next) => {
+  console.log(`[Discord Auth] Callback received: query=${JSON.stringify(req.query)} error=${req.query?.error}`);
   passport.authenticate("discord", { session: false }, (err, user) => {
     if (err || !user) {
+      console.error(`[Discord Auth] Callback error: err=${err?.message} user=${!!user}`);
       return res.status(401).json({ error: "auth_failed" });
     }
     const token = signToken(user, "discord");
-    const clientUrl = process.env.CLIENT_URL || "auris://auth";
+    console.log(`[Discord Auth] Authenticated: userId=${user._id} discordId=${user.discordId}`);
 
     // App (HTTP nativo): JSON directo. Navegador/WebView: 302 redirect
     const ua = (req.headers["user-agent"] || "").toLowerCase();
     if (ua.includes("okhttp") || ua.includes("dalvik")) {
+      console.log(`[Discord Auth] Native app response`);
       return res.json({ token, user: user.toPublicJSON() });
     }
-    res.redirect(`${clientUrl}?token=${encodeURIComponent(token)}`);
+
+    const fallback = process.env.CLIENT_URL || "auris://auth";
+    const state = req.query?.state;
+    let redirectUrl = `${fallback}?token=${encodeURIComponent(token)}`;
+    console.log(`[Discord Auth] state=${state} fallback=${fallback}`);
+
+    if (state) {
+      try {
+        const decoded = decodeURIComponent(state);
+        const uri = new URL(decoded);
+        const isLoopback = uri.hostname === "127.0.0.1" || uri.hostname === "localhost";
+        console.log(`[Discord Auth] Decoded state: ${decoded} isLoopback=${isLoopback}`);
+        if ((uri.protocol === "http:" || uri.protocol === "https:") && isLoopback) {
+          redirectUrl = `${uri.toString().replace(/\/$/, "")}?token=${encodeURIComponent(token)}`;
+        }
+      } catch (e) {
+        console.error(`[Discord Auth] State parse error: ${e.message}`);
+      }
+    }
+
+    console.log(`[Discord Auth] Redirecting to: ${redirectUrl}`);
+    res.redirect(redirectUrl);
   })(req, res, next);
 });
 
@@ -3340,66 +3379,79 @@ app.post("/api/auth/google", async (req, res) => {
 
     if (!idToken) return res.status(400).json({ error: "idToken is required" });
 
-    // Decodificar JWT y verificar claims manualmente (tokeninfo bloqueado desde VPS)
+    // Verificar ID token de Google con google-auth-library (verificación criptográfica local)
     let payload;
     try {
-      const b64 = idToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
-      payload = JSON.parse(Buffer.from(b64, "base64").toString());
+      const ticket = await googleAuthClient.verifyIdToken({
+        idToken,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
     } catch (e) {
-      return res.status(401).json({ error: "Invalid token format" });
+      console.error(`[Google Auth] Token verification failed:`, e.message);
+      return res.status(401).json({ error: "Invalid token" });
     }
-    console.log(`[Google Auth] Decoded token: aud=${payload.aud} iss=${payload.iss} sub=${payload.sub} exp=${payload.exp} iat=${payload.iat} email=${payload.email} now=${Math.floor(Date.now()/1000)}`);
-    if (payload.aud !== process.env.GOOGLE_CLIENT_ID) {
-      return res.status(401).json({ error: "Token audience mismatch" });
-    }
-    if (payload.exp && Date.now() >= payload.exp * 1000) {
-      console.log(`[Google Auth] Token expired: exp=${payload.exp} now=${Math.floor(Date.now()/1000)} diff=${Math.floor(Date.now()/1000 - payload.exp)}s aud=${payload.aud} iss=${payload.iss}`);
-      return res.status(401).json({ error: "Token expired" });
-    }
-    if (!payload.sub) {
-      return res.status(401).json({ error: "Missing sub" });
-    }
+    console.log(`[Google Auth] Verified token: aud=${payload.aud} iss=${payload.iss} sub=${payload.sub} exp=${payload.exp} email=${payload.email}`);
 
     const { sub: googleId, email: rawEmail, name, picture } = payload;
     const email = normalizeEmail(rawEmail);
 
-    // 1. Priorizar email para unir cuentas Google/email-password
-    let user = email ? await User.findOne({ email }) : null;
+    console.log(`[Google Auth] Looking up user: email=${email} googleId=${googleId}`);
+
+    // 1. Buscar por email primero (usa índice unique sparse), luego googleId
+    let user = email ? await User.findOne({ email }).maxTimeMS(3000) : null;
     if (!user) {
-      user = await User.findOne({ googleId });
+      user = await User.findOne({ googleId }).maxTimeMS(3000);
     }
+    console.log(`[Google Auth] findUser=${user ? user._id.toString() : "null"}`);
 
     if (!user) {
+      console.log(`[Google Auth] Creating new user: email=${email} googleId=${googleId}`);
       user = await User.create({
         username: name || `google_${googleId}`,
         email,
         googleId,
         avatar: picture || "",
       });
+      console.log(`[Google Auth] Created user: id=${user._id}`);
     } else {
       let needsSave = false;
       if (email && !user.email) {
         user.email = email;
         needsSave = true;
+        console.log(`[Google Auth] Updated email`);
       }
       if (!user.googleId) {
         user.googleId = googleId;
         needsSave = true;
+        console.log(`[Google Auth] Updated googleId`);
       }
       if (!user.avatar) {
         user.avatar = picture || "";
         needsSave = true;
+        console.log(`[Google Auth] Updated avatar`);
       }
-      if (needsSave) await user.save();
+      if (needsSave) {
+        console.log(`[Google Auth] Saving user...`);
+        await user.save();
+        console.log(`[Google Auth] Saved OK`);
+      } else {
+        console.log(`[Google Auth] No save needed`);
+      }
     }
 
     // 2. Extraer cookies YTM si el cliente las envía en el body o headers
     req.userId = user._id.toString();
+    console.log(`[Google Auth] Calling extractYtmCookies for userId=${req.userId}`);
     extractYtmCookies(req);
+    console.log(`[Google Auth] extractYtmCookies done`);
 
     // 3. Generar JWT y responder
+    console.log(`[Google Auth] Signing token...`);
     const token = signToken(user);
+    console.log(`[Google Auth] Sending response...`);
     res.json({ token, user: user.toPublicJSON() });
+    console.log(`[Google Auth] Response sent`);
 
   } catch (err) {
     console.error("[Google Auth POST] Error:", err.response?.data || err.message);

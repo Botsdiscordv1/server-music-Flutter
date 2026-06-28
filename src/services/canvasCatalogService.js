@@ -315,7 +315,7 @@ function buildCanonicalId(ids = {}, meta = {}) {
   const artist = resolveFolderArtist(meta);
   const releaseName = String(meta.releaseName || meta.album || "").trim();
   const releaseType = normalizeReleaseType(meta.releaseType || meta.albumType || (releaseName ? "Album" : null));
-  const bucket = String(meta.bucket || meta.sourceBucket || (meta.source === "spotify" ? "spotify" : "youtube")).trim() || "youtube";
+  const bucket = String(meta.bucket || meta.sourceBucket || "spotify").trim() || "spotify";
   const isRelease = meta.level === "release";
   const itemId = String(
     (isRelease ? meta.releaseId : meta.trackId)
@@ -359,7 +359,7 @@ function buildReleaseKey(input = {}, artist = null, releaseName = null) {
 }
 
 function buildReleasePrefix(recordOrInput = {}) {
-  const bucket = String(recordOrInput.bucket || recordOrInput.sourceBucket || (recordOrInput.source === "spotify" ? "spotify" : "youtube")).trim() || "youtube";
+  const bucket = String(recordOrInput.bucket || recordOrInput.sourceBucket || "spotify").trim() || "spotify";
   const artist = resolveFolderArtist(recordOrInput);
   const releaseName = String(recordOrInput.releaseName || recordOrInput.album || "").trim();
   const releaseType = normalizeStorageReleaseType(recordOrInput.releaseType || recordOrInput.albumType || null);
@@ -368,7 +368,7 @@ function buildReleasePrefix(recordOrInput = {}) {
 }
 
 function buildDedupeKey(record = {}) {
-  const bucket = String(record.bucket || "youtube").trim() || "youtube";
+  const bucket = String(record.bucket || "spotify").trim() || "spotify";
   const artist = normalizeText(record.primaryArtist || record.artist || "");
   const title = normalizeText(record.title || "");
   const ytVideoId = normalizeMaybeYouTubeVideoId(record.ids?.ytVideoId || record.ytVideoId || record.trackId || "");
@@ -399,7 +399,7 @@ function removeRecordFolder(record) {
   const dir = record.physicalPath || recordDir(record.canonicalId, record.status);
   if (!fs.existsSync(dir)) return;
   fs.rmSync(dir, { recursive: true, force: true });
-  cleanupEmptyParents(path.dirname(dir), path.join(CANVAS_LIBRARY_ROOT, LIBRARY_DIR, String(record.bucket || "youtube")));
+  cleanupEmptyParents(path.dirname(dir), path.join(CANVAS_LIBRARY_ROOT, LIBRARY_DIR, String(record.bucket || "spotify")));
 }
 
 function replaceReleasePrefix(canonicalId, oldPrefix, newPrefix) {
@@ -459,7 +459,7 @@ function recordDir(value, status = READY_DIR) {
   const input = typeof value === "object" && value !== null ? value : null;
   const canonicalId = input ? (input.canonicalId || buildCanonicalId(input.ids || {}, input)) : value;
   const parts = splitCanonicalId(canonicalId);
-  let bucket = safeSegment(input?.bucket || parts[0] || "youtube");
+  let bucket = safeSegment(input?.bucket || parts[0] || "spotify");
   if (parts.length > 0) {
     const head = safeSegment(parts[0]);
     if (STORAGE_BUCKETS.has(head)) {
@@ -547,7 +547,7 @@ function toRecord(input = {}, assetNames = {}) {
     releaseType,
     releaseId,
     trackId,
-    bucket: input.bucket || input.sourceBucket || (input.source === "spotify" ? "spotify" : "youtube"),
+    bucket: input.bucket || input.sourceBucket || "spotify",
     level,
     durationMs: Number(input.durationMs || 0) || 0,
     source: input.source || null,
@@ -599,12 +599,12 @@ function buildReleaseIdentity(input = {}) {
     releaseName,
     releaseType,
     releaseId,
-    bucket: input.bucket || input.sourceBucket || (input.source === "spotify" ? "spotify" : "youtube"),
+    bucket: input.bucket || input.sourceBucket || "spotify",
   };
 }
 
 function getReleaseGroupKeys(record = {}) {
-  const bucket = String(record.bucket || "youtube").trim();
+  const bucket = String(record.bucket || "spotify").trim();
   const artist = normalizeText(resolvePrimaryArtist(record));
   const releaseName = normalizeText(record.releaseName || record.album || "");
   const releaseId = String(record.releaseId || "").trim();
